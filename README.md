@@ -14,10 +14,10 @@ opencode plugin add github:fangfengxiang/opencode-remote-access
 
 重新打开 OpenCode Desktop，在 **设置 → 远程访问**中找到插件。OpenCode 加载仓库自带的 CommonJS 文件。
 
-更新 GitHub 安装：
+更新已安装的 GitHub 插件。OpenCode v2.3.0 使用无参数命令更新所有可更新的插件。
 
 ```bash
-opencode plugin update github:fangfengxiang/opencode-remote-access
+opencode plugin update
 ```
 
 如果以前通过本地目录安装过，可以从 OpenCode 全局配置的 `plugins` 数组移除旧目录条目，再运行原生安装命令。

@@ -49,6 +49,13 @@ const bundle = [
 
 const output = join(root, "gui-experimental.cjs");
 if (argumentsList[0] === "--check") {
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  // npm can run these hooks while installing a Git dependency. The GUI bundle ships prebuilt.
+  const preparationHooks = ["build", "prepare", "prepack", "preinstall", "install", "postinstall"];
+  if (manifest.workspaces || preparationHooks.some((hook) => Object.hasOwn(manifest.scripts ?? {}, hook))) {
+    console.error("The Git package must load the checked-in bundle without a preparation step.");
+    process.exitCode = 1;
+  }
   let current;
   try {
     current = readFileSync(output, "utf8");

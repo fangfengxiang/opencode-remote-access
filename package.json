@@ -1,13 +1,12 @@
 {
   "name": "opencode-remote-access",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Configure authenticated remote access from OpenCode Desktop settings.",
   "exports": {
     "./gui-experimental": "./gui-experimental.cjs"
   },
   "scripts": {
-    "build": "node scripts/build.cjs",
     "check:build": "node scripts/build.cjs --check",
     "test": "node scripts/build.cjs --check && node --test test/gateway.test.cjs && node test/main.cjs"
   }

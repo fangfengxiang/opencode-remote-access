@@ -23,3 +23,5 @@
 ## 发布产物
 
 `src/` 保留手写 CommonJS 源码。`node scripts/build.cjs` 生成根目录下的 `gui-experimental.cjs`，由 `package.json` 的 `./gui-experimental` 导出。构建仅使用 Node.js 内置模块。用户通过 `opencode plugin add` 注册 GitHub 包时，OpenCode 直接加载仓库自带的生成文件。`node scripts/build.cjs --check` 可校验生成文件与源码一致。
+
+清单提供校验与测试命令。开发者显式运行构建，GitHub 安装直接使用已提交的产物。

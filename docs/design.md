@@ -2,6 +2,10 @@
 
 **简体中文** · [English](en/design.md)
 
+## 设计思想
+
+**一个插件做一件事。** 本插件管理 OpenCode 自带 Web 界面的远程入口。远程访问策略由插件负责，会话与界面由 OpenCode 提供。
+
 ## 原生 GUI 与 IPC
 
 窗口使用 OpenCode 原生设置组件和错误提示。错误提示可关闭，也会自动消失。各语言文案在 `src/i18n/` 中维护，交给宿主 GUI 的 `Plugin.define({ i18n })` 和 `ctx.t()`。OpenCode v2.3.0 使用 `en`、`zh`、`zht` 和 `ru` 作为插件语言键。

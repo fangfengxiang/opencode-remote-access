@@ -8,7 +8,9 @@
 
 **运行要求：OpenCode Desktop v2，且支持 GUI 插件。**
 
-在 **OpenCode Desktop → 设置 → 远程访问**中管理监听地址、远程登录和设备。插件提供 HTTP 或 HTTPS Web 入口，支持密码登录、一次性配对和登录日志。设置页使用 OpenCode 原生组件，自动跟随桌面端语言，支持简体中文、繁體中文、English 和 Русский。
+在 **OpenCode Desktop → 设置 → 远程访问**启用监听，通过局域网或 Tailscale 打开 OpenCode 自带的 Web 界面，并在同一处管理 HTTPS、来源 IP 白名单和登录记录。
+
+**一个插件做一件事。** 本插件管理 OpenCode 自带 Web 界面的远程入口。远程访问策略由插件负责，会话与界面由 OpenCode 提供。
 
 ![远程访问设置页简体中文示例，密码已遮挡](docs/remote-access.png)
 

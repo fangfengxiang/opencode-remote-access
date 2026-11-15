@@ -8,7 +8,9 @@
 
 **Requires OpenCode Desktop v2 with GUI plugin support.**
 
-Open **OpenCode Desktop → Settings → Remote Access** to manage the listener, sign-in credentials, and connected devices. The plugin provides HTTP or HTTPS access to the OpenCode web interface, with password sign-in, one-time pairing, and a sign-in log. Its native settings page follows the Desktop language and supports Simplified Chinese, Traditional Chinese, English, and Russian.
+Enable remote access in **OpenCode Desktop → Settings → Remote Access**, open OpenCode’s built-in web interface over your local network or Tailscale, and manage HTTPS, source IP allowlists, and sign-in logs from one place.
+
+**One plugin, one job.** This plugin manages remote access to OpenCode’s built-in web interface. The plugin handles access policies, while OpenCode provides the sessions and interface.
 
 ![The Remote Access settings page in English, with a masked example password](docs/remote-access-en.png)
 

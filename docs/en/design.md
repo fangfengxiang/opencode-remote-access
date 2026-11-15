@@ -2,6 +2,10 @@
 
 [简体中文](../design.md) · **English**
 
+## Design principle
+
+**One plugin, one job.** This plugin manages remote access to OpenCode’s built-in web interface. The plugin handles access policies, while OpenCode provides the sessions and interface.
+
 ## Native GUI and IPC
 
 The window uses native OpenCode settings components and error toasts. Errors can be dismissed and also expire automatically. Translation catalogs live in `src/i18n/` and are passed to the host through `Plugin.define({ i18n })` and `ctx.t()`. OpenCode v2.3.0 uses the plugin locale keys `en`, `zh`, `zht`, and `ru`.

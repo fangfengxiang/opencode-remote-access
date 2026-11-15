@@ -99,6 +99,6 @@ For local development, `./install.sh` registers the checkout. Ship both `src/` a
 
 ## Authors
 
-[fangfengxiang](https://github.com/fangfengxiang) · Codex
+[fangfengxiang](https://github.com/fangfengxiang) · [Codex](https://github.com/codex)
 
 [AI documentation index](llms.txt)

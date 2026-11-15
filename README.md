@@ -99,6 +99,6 @@ npm test
 
 ## 作者
 
-[fangfengxiang](https://github.com/fangfengxiang) · Codex
+[fangfengxiang](https://github.com/fangfengxiang) · [Codex](https://github.com/codex)
 
 [AI 文档索引](llms.txt)

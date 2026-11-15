@@ -2,6 +2,7 @@
 (function (hostRequire, pluginModule, pluginExports) {
   const factories = Object.create(null);
   factories["./gateway.cjs"] = function (require, module, exports) {
+const { sourceFilter } = require("./source-filter.cjs");
 const http = require("node:http");
 const net = require("node:net");
 const { Buffer } = require("node:buffer");
@@ -10,6 +11,11 @@ const { createHash, createHmac, randomBytes, timingSafeEqual } = require("node:c
 const SESSION_SECONDS = 30 * 24 * 60 * 60;
 const PAIR_MS = 5 * 60 * 1000;
 const MAX_PAIRINGS = 256;
+const DEVICE_COOKIE = "opencode_remote_device";
+const DEVICE_SECONDS = 180 * 24 * 60 * 60;
+const MAX_RECENT_LOGINS = 1024;
+const SUCCESS_LOG_MS = 10 * 60 * 1000;
+const FAILURE_LOG_MS = 5 * 1000;
 const PAIR_CODE = /^[A-Za-z0-9_-]{22}$/;
 const PAIR_PATH = /^\/auth\/connect\/([A-Za-z0-9_-]{22})$/;
 const HOP_HEADERS = new Set([
@@ -26,6 +32,51 @@ function stripHeaders(headers) {
 
 function normalizedIP(ip = "") {
   return ip.replace(/^::ffff:/i, "");
+}
+
+function cookieValue(headers, name) {
+  const prefix = `${name}=`;
+  for (const cookie of String(headers.cookie ?? "").split(";")) {
+    const value = cookie.trim();
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return "";
+}
+
+function deviceMetadata(headers) {
+  const ua = String(headers["user-agent"] ?? "").slice(0, 512);
+  const platformHint = String(headers["sec-ch-ua-platform"] ?? "").slice(0, 32).replace(/^"|"$/g, "");
+  const modelHint = String(headers["sec-ch-ua-model"] ?? "").slice(0, 100).replace(/^"|"$/g, "");
+  let platform = "";
+  if (/^android$/i.test(platformHint) || /Android/i.test(ua)) platform = "Android";
+  else if (/^iOS$/i.test(platformHint) || /iPhone|iPad|iPod/i.test(ua)) platform = "iOS";
+  else if (/^macOS$/i.test(platformHint) || /Macintosh|Mac OS X/i.test(ua)) platform = "macOS";
+  else if (/^Windows$/i.test(platformHint) || /Windows/i.test(ua)) platform = "Windows";
+  else if (/^Chrome OS$/i.test(platformHint) || /CrOS/i.test(ua)) platform = "ChromeOS";
+  else if (/^Linux$/i.test(platformHint) || /Linux/i.test(ua)) platform = "Linux";
+
+  let browser = "";
+  if (/Opencode/i.test(ua)) browser = "OpenCode App";
+  else if (/Edg(?:A|iOS)?\//.test(ua)) browser = "Edge";
+  else if (/OPR\/|Opera/.test(ua)) browser = "Opera";
+  else if (/SamsungBrowser\//.test(ua)) browser = "Samsung Internet";
+  else if (/Firefox\/|FxiOS\//.test(ua)) browser = "Firefox";
+  else if (/Chrome\/|CriOS\//.test(ua)) browser = "Chrome";
+  else if (/Safari\//.test(ua)) browser = "Safari";
+  else if (/curl\//.test(ua)) browser = "curl";
+
+  let model = modelHint;
+  if (!model && platform === "Android") {
+    model = /Android[^;)]*;\s*([^;)]+?)\s+Build\//i.exec(ua)?.[1] ?? "";
+  }
+  model = model.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, 64);
+  if (/^(?:K|Android|Unknown)$/i.test(model)) model = "";
+  if (!model) model = /\b(iPhone|iPad|iPod)\b/i.exec(ua)?.[0] ?? "";
+  return {
+    label: Array.from(new Set([model, platform, browser].filter(Boolean))).join(" · "),
+    // Hash this transient value before it leaves the gateway.
+    seed: ua || [platform, model, browser].join(" "),
+  };
 }
 
 function secretDigest(value) {
@@ -60,7 +111,18 @@ function endUpgrade(socket, code, extra = "") {
   socket.end(`HTTP/1.1 ${code} ${http.STATUS_CODES[code]}\r\nConnection: close\r\n${extra}\r\n`);
 }
 
-async function openGateway({ host, port, username, password, upstreamUrl, upstreamHeaders = {}, onChange = () => {} }) {
+async function openGateway({
+  host,
+  port,
+  username,
+  password,
+  upstreamUrl,
+  upstreamHeaders = {},
+  allowedSources = "",
+  deviceKey = randomBytes(32),
+  onChange = () => {},
+  onLogin = () => {},
+}) {
   if (!net.isIP(host) || host === "0.0.0.0" || host === "::") throw new Error("请输入具体的本机监听 IP。");
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("监听端口无效。");
   if (typeof username !== "string" || !username.trim() || /[:\u0000-\u001f\u007f-\u009f]/.test(username)) {
@@ -70,6 +132,7 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
     throw new Error("密码不能为空，也不能包含控制字符。");
   }
 
+  const permits = sourceFilter(allowedSources);
   const upstream = new URL(upstreamUrl);
   if (upstream.protocol !== "http:" || !isLoopback(upstream.hostname) || upstream.username || upstream.password ||
       upstream.pathname !== "/" || upstream.search || upstream.hash) {
@@ -80,8 +143,8 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
   const expected = secretDigest(`${username}:${password}`);
   const key = randomBytes(32);
   const pairingCodes = new Map();
-  const activeSockets = new Set();
-  const peerCounts = new Map();
+  const activeSockets = new Map();
+  const recentLogins = new Map();
   const challenge = 'Basic realm="OpenCode Remote", charset="UTF-8"';
   const bindHost = net.isIPv6(host) ? `[${host}]` : host;
   let url;
@@ -89,19 +152,20 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
   let cookieName;
   let closing;
 
-  function sessionToken() {
+  function sessionToken(deviceId) {
     const expires = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
-    const nonce = randomBytes(24).toString("base64url");
+    const identity = deviceId || randomBytes(16).toString("base64url");
+    const nonce = identity + randomBytes(8).toString("base64url").slice(0, 10);
     const id = `${expires}.${nonce}`;
     const signature = createHmac("sha256", key).update(id).digest("base64url");
     return `${id}.${signature}`;
   }
 
-  function validSession(token = "") {
+  function sessionDevice(token = "") {
     const match = /^(\d{1,12})\.([A-Za-z0-9_-]{32})\.([A-Za-z0-9_-]{43})$/.exec(token);
-    if (!match || Number(match[1]) <= Math.floor(Date.now() / 1000)) return false;
+    if (!match || Number(match[1]) <= Math.floor(Date.now() / 1000)) return "";
     const signature = createHmac("sha256", key).update(`${match[1]}.${match[2]}`).digest("base64url");
-    return timingSafeEqual(Buffer.from(match[3]), Buffer.from(signature));
+    return timingSafeEqual(Buffer.from(match[3]), Buffer.from(signature)) ? match[2].slice(0, 22) : "";
   }
 
   function requestPath(request) {
@@ -110,24 +174,84 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
     return new URL(request.url, url);
   }
 
-  function isAuthorized(request, target) {
+  function authenticate(request, target) {
     const query = target.searchParams.get("auth_token");
     if (request.headers.authorization || query) {
       const credential = request.headers.authorization
         ? /^Basic\s+([^\s]+)$/i.exec(request.headers.authorization)?.[1]
         : query;
       const parsed = authenticateToken(credential, expected);
-      return parsed === true || validSession(parsed);
+      if (parsed === true) return { allowed: true, basic: true };
+      const deviceId = sessionDevice(parsed);
+      if (deviceId) return { allowed: true, basic: false, deviceId };
+      return { allowed: false, basic: Boolean(credential) };
     }
     const origin = request.headers.origin;
     const site = request.headers["sec-fetch-site"];
-    if ((origin && origin !== url) || (site && site !== "same-origin" && site !== "none")) return false;
-    for (const cookie of String(request.headers.cookie ?? "").split(";")) {
-      const name = `${cookieName}=`;
-      const value = cookie.trim();
-      if (value.startsWith(name)) return validSession(value.slice(name.length));
+    const sameOrigin = (!origin || origin === url) && (!site || site === "same-origin" || site === "none");
+    const deviceId = sameOrigin ? sessionDevice(cookieValue(request.headers, cookieName)) : "";
+    return { allowed: Boolean(deviceId), basic: false, deviceId };
+  }
+
+  function deviceDigest(value) {
+    return createHmac("sha256", deviceKey).update(value).digest("base64url");
+  }
+
+  function signedDevice(request) {
+    const token = cookieValue(request.headers, DEVICE_COOKIE);
+    const match = /^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/.exec(token);
+    if (!match) return "";
+    const [, id, signature] = match;
+    return timingSafeEqual(Buffer.from(signature), Buffer.from(deviceDigest(`cookie:${id}`))) ? id : "";
+  }
+
+  function browserNavigation(request) {
+    return request.headers["sec-fetch-mode"] === "navigate" || /\btext\/html\b/i.test(request.headers.accept ?? "");
+  }
+
+  function describePeer(request, issueDevice = false, sessionIdentity = "") {
+    const socket = activeSockets.get(request.socket);
+    if (!socket?.ip) return undefined;
+    const metadata = deviceMetadata(request.headers);
+    const fallback = deviceDigest(JSON.stringify(["fallback", socket.ip, metadata.seed])).slice(0, 22);
+    let id = sessionIdentity || signedDevice(request);
+    let cookie;
+    if (!id && issueDevice) {
+      socket.browserId ??= randomBytes(16).toString("base64url");
+      id = socket.browserId;
+      const token = `${id}.${deviceDigest(`cookie:${id}`)}`;
+      cookie = `${DEVICE_COOKIE}=${token}; Path=/; Max-Age=${DEVICE_SECONDS}; HttpOnly; SameSite=Lax`;
     }
-    return false;
+    id ||= socket.browserId || fallback;
+    if (socket.deviceId !== id || socket.deviceLabel !== metadata.label) {
+      socket.deviceId = id;
+      socket.deviceLabel = metadata.label;
+      if (!closing) onChange();
+    }
+    return {
+      ip: socket.ip,
+      local: socket.local,
+      deviceId: id,
+      deviceLabel: metadata.label,
+      cookie,
+    };
+  }
+
+  function recordLogin(peer, method, success) {
+    if (!peer || closing) return;
+    const timestamp = Date.now();
+    const identity = success ? peer.deviceId : peer.ip;
+    const key = JSON.stringify([identity, method, success]);
+    if ((recentLogins.get(key) ?? 0) > timestamp) return;
+    if (recentLogins.size >= MAX_RECENT_LOGINS) {
+      for (const [id, expires] of recentLogins) {
+        if (expires <= timestamp) recentLogins.delete(id);
+      }
+      if (recentLogins.size >= MAX_RECENT_LOGINS) recentLogins.delete(recentLogins.keys().next().value);
+    }
+    recentLogins.set(key, timestamp + (success ? SUCCESS_LOG_MS : FAILURE_LOG_MS));
+    const { ip, deviceId, deviceLabel, local } = peer;
+    onLogin({ timestamp, ip, deviceId, deviceLabel, local, method, success });
   }
 
   function proxyOptions(request, target, upgrade = false) {
@@ -154,7 +278,10 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
   function redeem(request, response, path) {
     request.resume();
     const fail = (code, message) => {
-      if (!response.destroyed && !response.headersSent) reply(response, code, message);
+      if (!response.destroyed && !response.headersSent) {
+        recordLogin(describePeer(request), "pair", false);
+        reply(response, code, message);
+      }
     };
     // OpenCode consumes the original code. Only the gateway's own token is returned to peers.
     const pairing = http.get({
@@ -185,12 +312,17 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
           fail(502, "无法完成配对。");
           return;
         }
-        const token = sessionToken();
-        if (/\btext\/html\b/i.test(request.headers.accept ?? "")) {
+        const browser = /\btext\/html\b/i.test(request.headers.accept ?? "");
+        const peer = describePeer(request, browser);
+        const token = sessionToken(peer?.deviceId);
+        recordLogin(peer, "pair", true);
+        if (browser) {
+          const cookies = [`${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax`];
+          if (peer?.cookie) cookies.push(peer.cookie);
           response.writeHead(302, {
             Location: "/",
             "Cache-Control": "no-store",
-            "Set-Cookie": `${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax`,
+            "Set-Cookie": cookies,
           });
           response.end();
         } else {
@@ -205,6 +337,10 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
   }
 
   function forward(request, response) {
+    if (activeSockets.get(request.socket)?.blocked) {
+      request.resume();
+      return reply(response, 403, "Source IP blocked.", { Connection: "close" });
+    }
     const target = requestPath(request);
     if (!target) return reply(response, 400, "监听地址无效。");
     const code = request.method === "GET" && PAIR_PATH.exec(request.url.split("?", 1)[0])?.[1];
@@ -213,12 +349,16 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
       pairingCodes.delete(code);
       if (!expires || expires <= Date.now()) {
         request.resume();
+        recordLogin(describePeer(request), "pair", false);
         return reply(response, 401, "配对链接无效或已使用。");
       }
       redeem(request, response, target.pathname);
       return;
     }
-    if (!isAuthorized(request, target)) {
+    const auth = authenticate(request, target);
+    const peer = describePeer(request, auth.allowed && auth.basic && browserNavigation(request), auth.deviceId);
+    if (auth.basic) recordLogin(peer, "basic", auth.allowed);
+    if (!auth.allowed) {
       request.resume();
       return reply(response, 401, "需要远程登录。", { "WWW-Authenticate": challenge });
     }
@@ -227,6 +367,7 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
       const headers = stripHeaders(result.headers);
       delete headers["set-cookie"];
       delete headers["www-authenticate"];
+      if (peer?.cookie) headers["set-cookie"] = peer.cookie;
       response.writeHead(result.statusCode, headers);
       result.on("error", () => response.destroy());
       result.pipe(response);
@@ -243,11 +384,15 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
   const server = http.createServer(forward);
   server.on("upgrade", (request, client, clientHead) => {
     client.on("error", () => client.destroy());
+    if (activeSockets.get(client)?.blocked) return endUpgrade(client, 403);
     const target = requestPath(request);
     if (!target || request.headers.upgrade?.toLowerCase() !== "websocket") {
       return endUpgrade(client, 400);
     }
-    if (!isAuthorized(request, target)) {
+    const auth = authenticate(request, target);
+    const peer = describePeer(request, false, auth.deviceId);
+    if (auth.basic) recordLogin(peer, "basic", auth.allowed);
+    if (!auth.allowed) {
       return endUpgrade(client, 401, `WWW-Authenticate: ${challenge}\r\n`);
     }
     const outgoing = http.request(proxyOptions(request, target, true));
@@ -279,17 +424,19 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
 
   server.on("connection", (socket) => {
     const ip = normalizedIP(socket.remoteAddress);
-    activeSockets.add(socket);
-    if (ip) peerCounts.set(ip, (peerCounts.get(ip) ?? 0) + 1);
-    if (ip && !closing) onChange();
+    const local = ip === normalizedIP(host) || ip === "::1" || (net.isIPv4(ip) && ip.startsWith("127."));
+    const blocked = !permits(ip);
+    const peer = { ip, local, deviceId: "", deviceLabel: "", blocked };
+    activeSockets.set(socket, peer);
+    if (blocked) {
+      recordLogin(peer, "blocked", false);
+      socket.setTimeout(4000, () => socket.destroy());
+    } else if (ip && !closing) {
+      onChange();
+    }
     socket.once("close", () => {
       activeSockets.delete(socket);
-      if (ip && !closing) {
-        const count = peerCounts.get(ip) - 1;
-        if (count) peerCounts.set(ip, count);
-        else peerCounts.delete(ip);
-        onChange();
-      }
+      if (ip && !blocked && !closing) onChange();
     });
   });
 
@@ -313,15 +460,35 @@ async function openGateway({ host, port, username, password, upstreamUrl, upstre
         if (expires <= now) pairingCodes.delete(stored);
       }
       if (pairingCodes.size >= MAX_PAIRINGS) pairingCodes.delete(pairingCodes.keys().next().value);
-      pairingCodes.set(code, now + PAIR_MS);
+      const expiresAt = now + PAIR_MS;
+      pairingCodes.set(code, expiresAt);
+      return expiresAt;
     },
-    peers: () => Array.from(peerCounts, ([ip, count]) => ({ ip, count })).sort((left, right) => left.ip.localeCompare(right.ip)),
+    peers() {
+      const groups = new Map();
+      for (const { ip, local, deviceId, deviceLabel, blocked } of activeSockets.values()) {
+        if (!ip || blocked) continue;
+        const key = JSON.stringify([ip, deviceId]);
+        const existing = groups.get(key);
+        if (existing) {
+          existing.count += 1;
+          if (!existing.deviceLabel && deviceLabel) existing.deviceLabel = deviceLabel;
+        } else {
+          groups.set(key, { ip, local, deviceId, deviceLabel, count: 1 });
+        }
+      }
+      return Array.from(groups.values()).sort((left, right) =>
+        left.ip.localeCompare(right.ip) || left.deviceId.localeCompare(right.deviceId),
+      );
+    },
+    clearLoginDebounce: () => recentLogins.clear(),
     close() {
       if (closing) return closing;
       closing = new Promise((resolve) => server.close(resolve));
-      for (const socket of activeSockets) socket.destroy();
-      peerCounts.clear();
+      for (const socket of activeSockets.keys()) socket.destroy();
+      activeSockets.clear();
       pairingCodes.clear();
+      recentLogins.clear();
       return closing;
     },
   };
@@ -337,24 +504,54 @@ const fs = require("node:fs/promises");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { randomUUID } = require("node:crypto");
+const { randomBytes, randomUUID } = require("node:crypto");
 const { Buffer } = require("node:buffer");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const { createLoginLog } = require("./login-log.cjs");
+const { sourceFilter } = require("./source-filter.cjs");
 
 const configuration = Schema.Struct({
   listenHost: Schema.String,
   listenPort: Schema.Number,
   username: Schema.String,
   password: Schema.String,
+  allowedSources: Schema.String,
 });
+const deviceFields = {
+  ip: Schema.String,
+  deviceId: Schema.String,
+  deviceLabel: Schema.String,
+  isLocal: Schema.Boolean,
+};
+const aliasFields = {
+  deviceId: Schema.String,
+  alias: Schema.String,
+};
+const eventFields = {
+  ...deviceFields,
+  timestamp: Schema.Number,
+  method: Schema.String,
+  success: Schema.Boolean,
+};
 const listenerState = Schema.Struct({
   url: Schema.String,
-  peers: Schema.Array(Schema.Struct({ ip: Schema.String, count: Schema.Number })),
+  peers: Schema.Array(Schema.Struct({ ...deviceFields, count: Schema.Number, alias: Schema.String })),
+  restarting: Schema.Boolean,
+  restartPending: Schema.Boolean,
 });
+const loginLogs = Schema.Array(Schema.Struct({ ...eventFields, alias: Schema.String }));
+const deviceAliases = Schema.Array(Schema.Struct(aliasFields));
+const loginLogSettings = { enabled: Schema.Boolean, path: Schema.String };
+const loginLogInfo = Schema.Struct({ ...loginLogSettings, size: Schema.Number });
 const Remote = Ipc.define({
   id: "opencode-remote-access",
-  events: { listenerChanged: listenerState },
+  events: {
+    listenerChanged: listenerState,
+    loginLogsChanged: loginLogs,
+    loginLogInfoChanged: loginLogInfo,
+    deviceAliasesChanged: deviceAliases,
+  },
   methods: {
     listener: { output: listenerState },
     status: { output: Schema.Struct({
@@ -362,49 +559,74 @@ const Remote = Ipc.define({
       localPort: Schema.Number,
       url: Schema.String,
       configError: Schema.String,
+      restartPending: Schema.Boolean,
     }) },
     save: { input: configuration },
+    saveAndRestart: { input: configuration },
     start: {},
     stop: {},
     openBrowser: {},
-    pair: { output: Schema.String },
+    pair: { output: Schema.Struct({ output: Schema.String, expiresAt: Schema.Number }) },
+    loginLogs: { output: loginLogs },
+    clearLoginLogs: {},
+    loginLogInfo: { output: loginLogInfo },
+    configureLoginLog: { input: Schema.Struct(loginLogSettings) },
+    openLoginLog: {},
+    deviceAliases: { output: deviceAliases },
+    setDeviceAlias: { input: Schema.Struct(aliasFields) },
   },
 });
 
-const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "" };
+const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "" };
+const aliasLimit = 300;
+const deviceIdPattern = /^[A-Za-z0-9_-]{22}$/u;
 const controlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
 
-function validate(config) {
-  const { listenHost, listenPort, username, password } = config;
+function validate(config, error) {
+  const { listenHost, listenPort, username, password, allowedSources } = config;
   if (!net.isIPv4(listenHost) || listenHost === "0.0.0.0") {
-    throw new Error("请输入要监听的具体 IPv4 地址。");
+    throw error("error.invalidIp");
   }
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
-    throw new Error("端口须为 1 到 65535 的整数。");
+    throw error("error.invalidPort");
   }
   if (!username.trim() || username.includes(":") || controlCharacters.test(username)) {
-    throw new Error("账号不能为空，且不能包含冒号或控制字符。");
+    throw error("error.invalidUsername");
   }
   if (!password.trim() || controlCharacters.test(password)) {
-    throw new Error("密码不能为空，且不能包含控制字符。");
+    throw error("error.invalidPassword");
   }
   if (Buffer.byteLength(username) > 256 || Buffer.byteLength(password) > 1024) {
-    throw new Error("账号和密码分别不能超过 256 字节和 1024 字节。");
+    throw error("error.credentialsTooLong");
   }
-  return { listenHost, listenPort, username, password };
+  try {
+    sourceFilter(allowedSources);
+  } catch {
+    throw error("error.allowlist");
+  }
+  return { listenHost, listenPort, username, password, allowedSources: allowedSources.trim() };
 }
 
 function attachMain(ctx, { openGateway, openControl }) {
   const configPath = path.join(os.homedir(), ".opencode", "remote.json");
   const run = promisify(execFile);
+  const problem = (key, values) => new Error(ctx.t(key, values));
+  const deviceKeyStore = ctx.storage.store("device-key", { schema: Schema.String, initial: "" });
+  if (!deviceKeyStore.value) deviceKeyStore.set(randomBytes(32).toString("base64url"));
+  const aliasesStore = ctx.storage.store("device-aliases", { schema: deviceAliases, initial: [] });
+  let provider;
+  let loginLogRevision = 0;
+  const loginLog = createLoginLog(ctx, { onChange: () => void notifyLoginLogChanges() });
   let active;
+  let savedConfig;
+  let restarting = false;
   let controlLease;
   let pending = Promise.resolve();
   let disposing = false;
 
   const serial = (operation) => (...args) => {
     const result = pending.then(() => {
-      if (disposing) throw new Error("远程访问插件正在关闭。");
+      if (disposing) throw problem("error.pluginClosing");
       return operation(...args);
     });
     pending = result.catch(() => {});
@@ -412,14 +634,17 @@ function attachMain(ctx, { openGateway, openControl }) {
   };
 
   async function writeRemote(config) {
-    await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
     const temporary = `${configPath}.${randomUUID()}.tmp`;
     try {
+      await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
       await fs.writeFile(temporary, JSON.stringify(config, null, 2) + "\n", { flag: "wx", mode: 0o600 });
       await fs.rename(temporary, configPath);
+    } catch {
+      throw problem("error.saveFailed");
     } finally {
-      await fs.rm(temporary, { force: true });
+      await fs.rm(temporary, { force: true }).catch(() => {});
     }
+    savedConfig = config;
   }
 
   async function load() {
@@ -430,7 +655,9 @@ function attachMain(ctx, { openGateway, openControl }) {
       if (metadata.mode & 0o077) await fs.chmod(configPath, 0o600);
       config = JSON.parse(await fs.readFile(configPath, "utf8"));
     } catch (error) {
-      if (error.code === "ENOENT") return { ...blankConfig };
+      if (error.code === "ENOENT") {
+        return (savedConfig = { ...blankConfig });
+      }
       throw error;
     }
     if (!config || typeof config !== "object" || Array.isArray(config)) {
@@ -441,16 +668,96 @@ function attachMain(ctx, { openGateway, openControl }) {
       listenPort: config.listenPort ?? blankConfig.listenPort,
       username: config.username ?? blankConfig.username,
       password: config.password ?? blankConfig.password,
+      allowedSources: config.allowedSources ?? blankConfig.allowedSources,
     };
     if (typeof values.listenHost !== "string" || !Number.isInteger(values.listenPort) ||
-        typeof values.username !== "string" || typeof values.password !== "string") {
+        typeof values.username !== "string" || typeof values.password !== "string" ||
+        typeof values.allowedSources !== "string") {
       throw new Error("remote.json 的字段类型无效。");
     }
+    savedConfig = values;
     return values;
   }
 
+  function pendingRestart() {
+    return Boolean(active && savedConfig &&
+      Object.keys(savedConfig).some((key) => savedConfig[key] !== active.config[key]));
+  }
+
+  function displayDevice(device, host) {
+    const deviceId = device.deviceId || "";
+    return {
+      ip: device.ip,
+      deviceId,
+      deviceLabel: device.deviceLabel || "",
+      isLocal: Boolean(device.local || device.ip === host),
+      alias: aliasesStore.value.find((entry) => entry.deviceId === deviceId)?.alias || "",
+    };
+  }
+
   function listener() {
-    return active ? { url: active.gateway.url, peers: active.gateway.peers() } : { url: "", peers: [] };
+    return {
+      url: active?.gateway.url || "",
+      peers: active?.gateway.peers().map((device) => ({
+        ...displayDevice(device, active.config.listenHost),
+        count: device.count,
+      })) || [],
+      restarting,
+      restartPending: pendingRestart(),
+    };
+  }
+
+  async function listLoginLogs() {
+    const events = await loginLog.entries();
+    const labels = new Map(aliasesStore.value.map(({ deviceId, alias }) => [deviceId, alias]));
+    return events.map(({ timestamp, ip, deviceId, deviceLabel, local, isLocal, method, success }) => ({
+      timestamp, ip, deviceId, deviceLabel, isLocal: Boolean(local ?? isLocal), method, success,
+      alias: labels.get(deviceId) || "",
+    })).reverse();
+  }
+
+  async function notifyLoginLogChanges() {
+    if (!provider || disposing) return;
+    const revision = ++loginLogRevision;
+    try {
+      const [entries, info] = await Promise.all([listLoginLogs(), loginLog.info()]);
+      if (disposing || revision !== loginLogRevision) return;
+      provider.emit("loginLogsChanged", entries);
+      provider.emit("loginLogInfoChanged", info);
+    } catch {
+      ctx.log.write("warn", "OpenCode Remote Access failed to refresh login logs");
+    }
+  }
+
+  function recordLogin(event, host) {
+    const { timestamp, method, success } = event;
+    if (disposing || !Number.isFinite(timestamp) || !["basic", "pair", "blocked"].includes(method) ||
+        typeof success !== "boolean" || !net.isIP(event.ip)) return;
+    const { ip, deviceId, deviceLabel, isLocal } = displayDevice(event, host);
+    try {
+      loginLog.record({ timestamp, ip, deviceId, deviceLabel, isLocal, method, success });
+    } catch {
+      ctx.log.write("warn", "OpenCode Remote Access failed to store a login event");
+    }
+  }
+
+  function setDeviceAlias({ deviceId, alias }) {
+    if (!deviceIdPattern.test(deviceId)) throw problem("error.invalidDeviceId");
+    const value = alias.trim();
+    if (value.length > 80 || controlCharacters.test(value)) throw problem("error.invalidDeviceAlias");
+    const entries = aliasesStore.value.filter((entry) => entry.deviceId !== deviceId);
+    if (value) {
+      if (entries.length >= aliasLimit) throw problem("error.aliasLimit");
+      entries.push({ deviceId, alias: value });
+    }
+    try {
+      aliasesStore.set(entries);
+    } catch {
+      throw problem("error.aliasSaveFailed");
+    }
+    provider.emit("deviceAliasesChanged", aliasesStore.value);
+    notifyListener();
+    void notifyLoginLogChanges();
   }
 
   function notifyListener() {
@@ -467,19 +774,19 @@ function attachMain(ctx, { openGateway, openControl }) {
 
   function checkRemotePort(config, sidecar) {
     if (config.listenPort === sidecar?.port) {
-      throw new Error(`远程监听端口不能与桌面服务端口 ${sidecar.port} 相同。`);
+      throw problem("error.portConflict", { port: sidecar.port });
     }
   }
 
   async function bindGateway(config) {
     const sidecar = currentSidecar();
     checkRemotePort(config, sidecar);
-    if (!sidecar) throw new Error("OpenCode 本机服务尚未就绪。");
+    if (!sidecar) throw problem("error.sidecarNotReady");
 
     const assigned = Object.values(os.networkInterfaces()).some((addresses) => addresses?.some(
       (address) => address.address === config.listenHost,
     ));
-    if (!assigned) throw new Error("监听地址不在本机网卡上，请检查 VPN 或网络配置。");
+    if (!assigned) throw problem("error.ipNotAssigned");
 
     let bound;
     try {
@@ -488,8 +795,13 @@ function attachMain(ctx, { openGateway, openControl }) {
         port: config.listenPort,
         username: config.username,
         password: config.password,
+        allowedSources: config.allowedSources,
         upstreamUrl: sidecar.endpoint.url,
         upstreamHeaders: sidecar.endpoint.headers ?? {},
+        deviceKey: deviceKeyStore.value,
+        onLogin: (event) => {
+          if (bound && active === bound) recordLogin(event, config.listenHost);
+        },
         onChange: () => {
           if (bound && active === bound) notifyListener();
         },
@@ -497,16 +809,16 @@ function attachMain(ctx, { openGateway, openControl }) {
       bound = { gateway, config };
       return bound;
     } catch (error) {
-      if (error.code === "EADDRINUSE") throw new Error(`端口 ${config.listenPort} 已被占用，请选择其他端口。`);
-      if (error.code === "EADDRNOTAVAIL") throw new Error("监听地址当前不可用，请检查 VPN 或网络配置。");
-      if (error.code === "EACCES") throw new Error(`没有权限监听端口 ${config.listenPort}。`);
-      throw error;
+      if (error.code === "EADDRINUSE") throw problem("error.portInUse", { port: config.listenPort });
+      if (error.code === "EADDRNOTAVAIL") throw problem("error.ipUnavailable");
+      if (error.code === "EACCES") throw problem("error.portPermission", { port: config.listenPort });
+      throw problem("error.startFailed");
     }
   }
 
   async function start(config) {
     if (active) return;
-    active = await bindGateway(validate(config));
+    active = await bindGateway(validate(config, problem));
     notifyListener();
   }
 
@@ -527,48 +839,61 @@ function attachMain(ctx, { openGateway, openControl }) {
   }
 
   async function save(input) {
-    const next = validate(input);
+    const next = validate(input, problem);
+    checkRemotePort(next, currentSidecar());
+    await writeRemote(next);
+    notifyListener();
+  }
+
+  async function saveAndRestart(input) {
+    const next = validate(input, problem);
     checkRemotePort(next, currentSidecar());
     const previous = active;
-    const changed = previous && Object.keys(next).some((key) => next[key] !== previous.config[key]);
-    if (!changed) {
+    if (!previous) {
       await writeRemote(next);
-      return;
-    }
-
-    // Bind a different endpoint before retiring the active gateway.
-    if (previous.config.listenHost !== next.listenHost || previous.config.listenPort !== next.listenPort) {
-      const replacement = await bindGateway(next);
-      try {
-        await writeRemote(next);
-      } catch (error) {
-        await replacement.gateway.close();
-        throw error;
-      }
-      active = replacement;
       notifyListener();
-      await previous.gateway.close();
       return;
     }
 
+    restarting = true;
+    notifyListener();
     try {
-      await closeGateway();
-      await start(next);
-      await writeRemote(next);
-    } catch (error) {
+      if (previous.config.listenHost !== next.listenHost || previous.config.listenPort !== next.listenPort) {
+        // Validate the replacement binding before disturbing the active endpoint.
+        const replacement = await bindGateway(next);
+        try {
+          await writeRemote(next);
+        } catch (error) {
+          await replacement.gateway.close();
+          throw error;
+        }
+        active = replacement;
+        await previous.gateway.close();
+        return;
+      }
+
       try {
         await closeGateway();
-        await start(previous.config);
-      } catch {
-        controlLease = undefined;
-        throw new Error("保存失败，原监听也未能自动恢复。请检查网络和端口后重新启动监听。");
+        await start(next);
+        await writeRemote(next);
+      } catch (error) {
+        try {
+          await closeGateway();
+          await start(previous.config);
+        } catch {
+          controlLease = undefined;
+          throw problem("error.restoreFailed");
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      restarting = false;
+      notifyListener();
     }
   }
 
   async function pair() {
-    if (!active) throw new Error("请先启动远程监听。");
+    if (!active) throw problem("error.listenerStopped");
     const { gateway } = active;
     try {
       const [binary, ...prefix] = ctx.cli.command;
@@ -578,39 +903,63 @@ function attachMain(ctx, { openGateway, openControl }) {
       });
       const output = stdout.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trimEnd();
       for (const candidate of output.match(/https?:\/\/[^\s]+/gu) ?? []) {
-        const url = new URL(candidate);
+        let url;
+        try {
+          url = new URL(candidate);
+        } catch {
+          continue;
+        }
         const code = /^\/auth\/connect\/([A-Za-z0-9_-]{22})$/.exec(url.pathname)?.[1];
         if (url.origin === gateway.url && code && !url.search && !url.hash) {
-          gateway.allowPairing(code);
-          return output;
+          const expiresAt = gateway.allowPairing(code);
+          return { output, expiresAt };
         }
       }
     } catch {
-      throw new Error("无法生成配对码，请检查 OpenCode 本机服务。");
+      throw problem("error.pairFailed");
     }
-    throw new Error("OpenCode 返回的配对链接与当前监听地址不匹配。");
+    throw problem("error.pairAddressMismatch");
   }
 
-  const provider = ctx.provide(Remote, {
+  provider = ctx.provide(Remote, {
     listener,
     status: serial(async () => {
       const { url } = listener();
       const localPort = currentSidecar()?.port ?? 0;
       try {
-        return { config: await load(), localPort, url, configError: "" };
+        const config = await load();
+        return { config, localPort, url, configError: "", restartPending: pendingRestart() };
       } catch {
-        return { config: { ...blankConfig }, localPort, url, configError: "无法读取 remote.json，请检查配置或重新保存。" };
+        return {
+          config: { ...blankConfig }, localPort, url,
+          configError: ctx.t("error.configRead"), restartPending: pendingRestart(),
+        };
       }
     }),
     save: serial(save),
+    saveAndRestart: serial(saveAndRestart),
     start: serial(async () => { if (!active) await start(await load()); }),
     stop: serial(stop),
     openBrowser: serial(async () => {
       const { url } = listener();
-      if (!url) throw new Error("请先启动远程监听。");
-      await shell.openExternal(url);
+      if (!url) throw problem("error.listenerStopped");
+      try {
+        await shell.openExternal(url);
+      } catch {
+        throw problem("error.browserFailed");
+      }
     }),
     pair: serial(pair),
+    loginLogs: listLoginLogs,
+    loginLogInfo: () => loginLog.info(),
+    configureLoginLog: serial(async (options) => { await loginLog.configure(options); }),
+    openLoginLog: serial(async () => { await loginLog.open(); }),
+    clearLoginLogs: serial(async () => {
+      await loginLog.clear();
+      active?.gateway.clearLoginDebounce?.();
+    }),
+    deviceAliases: () => aliasesStore.value,
+    setDeviceAlias: serial(setDeviceAlias),
   });
 
   const control = openControl && Promise.resolve().then(() => openControl({
@@ -624,7 +973,7 @@ function attachMain(ctx, { openGateway, openControl }) {
     stop: serial(async (lease) => {
       if (lease && lease === controlLease) await stop();
     }),
-    pair: serial(pair),
+    pair: serial(async () => (await pair()).output),
     credentials: serial(async () => {
       const { username, password } = active?.config ?? await load();
       return { username, password };
@@ -633,10 +982,14 @@ function attachMain(ctx, { openGateway, openControl }) {
     if (!disposing) ctx.log.write("warn", "OpenCode Remote Access terminal control unavailable");
   });
 
-  ctx.log.write("info", "OpenCode Remote Access gateway loaded");
+  ctx.log.write("info", "OpenCode Remote Access activity controls loaded");
   return async () => {
     disposing = true;
-    await Promise.allSettled([control?.then((close) => close?.()), pending.then(stop)]);
+    await Promise.allSettled([
+      control?.then((close) => close?.()),
+      pending.then(stop),
+      Promise.resolve().then(() => loginLog.flush()),
+    ]);
   };
 }
 
@@ -770,6 +1123,2837 @@ async function openControl(handlers) {
 
 module.exports = { openControl };
   };
+  factories["./login-log.cjs"] = function (require, module, exports) {
+const { shell } = require("electron");
+const { Schema } = require("effect");
+const fs = require("node:fs/promises");
+const { constants } = require("node:fs");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+
+const HEADER = '{"format":"opencode-remote-access/login-v1"}\n';
+const ENTRY_LIMIT = 500;
+const FILE_LIMIT = 1024 * 1024;
+const BATCH_LIMIT = 128;
+
+function normalize(entry) {
+  if (!entry || !Number.isSafeInteger(entry.timestamp) || !net.isIP(entry.ip) ||
+      !["basic", "pair", "blocked"].includes(entry.method) || typeof entry.success !== "boolean") {
+    return undefined;
+  }
+  return {
+    timestamp: entry.timestamp,
+    ip: entry.ip,
+    deviceId: /^[A-Za-z0-9_-]{0,128}$/.test(entry.deviceId ?? "") ? (entry.deviceId ?? "") : "",
+    deviceLabel: String(entry.deviceLabel ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/gu, "").slice(0, 160),
+    isLocal: Boolean(entry.isLocal ?? entry.local),
+    method: entry.method,
+    success: entry.success,
+  };
+}
+
+function createLoginLog(ctx, { onChange }) {
+  const settings = ctx.storage.store("login-log-settings", {
+    schema: Schema.Struct({ enabled: Schema.Boolean, path: Schema.String }),
+    initial: { enabled: true, path: path.join(os.homedir(), ".opencode", "remote-access", "login.jsonl") },
+  });
+  let queue = Promise.resolve();
+  let timer;
+  let pending = [];
+
+  const error = (key) => new Error(ctx.t(key));
+  function enqueue(operation) {
+    const result = queue.then(operation);
+    queue = result.catch(() => {});
+    return result;
+  }
+
+  function safeFile(stat) {
+    return stat.isFile() && stat.nlink === 1 &&
+      (typeof process.getuid !== "function" || stat.uid === process.getuid());
+  }
+
+  async function read(file) {
+    let handle;
+    try {
+      handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | constants.O_NONBLOCK);
+      const stat = await handle.stat();
+      if (!safeFile(stat)) throw error("error.logFile");
+      if (stat.size > FILE_LIMIT) throw error("error.logTooLarge");
+      const bytes = await handle.readFile();
+      if (!bytes.length) return { exists: true, entries: [] };
+      if (bytes.length > FILE_LIMIT) throw error("error.logTooLarge");
+      const text = bytes.toString("utf8");
+      if (!text.startsWith(HEADER)) throw error("error.logFile");
+      if (stat.mode & 0o077) await handle.chmod(0o600);
+      const entries = [];
+      for (const line of text.slice(HEADER.length).split("\n")) {
+        if (!line) continue;
+        try {
+          const event = normalize(JSON.parse(line));
+          if (event) entries.push(event);
+        } catch {}
+      }
+      return { exists: true, entries: entries.slice(-ENTRY_LIMIT) };
+    } catch (failure) {
+      if (failure.code === "ENOENT") return { exists: false, entries: [] };
+      if (failure.code) throw error("error.logFile");
+      throw failure;
+    } finally {
+      await handle?.close();
+    }
+  }
+
+  async function write(file, entries, exists) {
+    const content = entries.length ? HEADER + entries.map((entry) => JSON.stringify(entry) + "\n").join("") : "";
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const temporary = path.join(path.dirname(file), `.opencode-log-${randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+      if (exists) {
+        const current = await fs.lstat(file);
+        if (!safeFile(current)) throw error("error.logFile");
+        await fs.rename(temporary, file);
+      } else {
+        // Linking into place avoids replacing a file created after the initial check.
+        await fs.link(temporary, file);
+      }
+    } catch (failure) {
+      if (failure.code) throw error("error.logSave");
+      throw failure;
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
+  }
+
+  function flush() {
+    clearTimeout(timer);
+    timer = undefined;
+    if (!pending.length) return queue;
+    const events = pending;
+    pending = [];
+    return enqueue(async () => {
+      const file = settings.value.path;
+      const batch = events.filter((item) => item.file === file).map((item) => item.event);
+      if (!batch.length) return;
+      const current = await read(file);
+      await write(file, [...current.entries, ...batch].slice(-ENTRY_LIMIT), current.exists);
+      onChange();
+    });
+  }
+
+  return {
+    entries: () => enqueue(async () => (await read(settings.value.path)).entries),
+    info: () => enqueue(async () => {
+      const current = settings.value;
+      const stat = await fs.lstat(current.path).catch(() => undefined);
+      return { ...current, size: stat && safeFile(stat) ? stat.size : 0 };
+    }),
+    async configure(next) {
+      if (!path.isAbsolute(next.path) || next.path.includes("\0")) throw error("error.logPath");
+      const file = path.normalize(next.path);
+      await flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));
+      return enqueue(async () => {
+        await read(file);
+        settings.set({ enabled: next.enabled, path: file });
+        onChange();
+      });
+    },
+    open: () => enqueue(async () => {
+      const file = settings.value.path;
+      const current = await read(file);
+      if (!current.exists) await write(file, [], false);
+      if (await shell.openPath(file)) throw error("error.logOpen");
+      onChange();
+    }),
+    async clear() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      pending = [];
+      return enqueue(async () => {
+        const file = settings.value.path;
+        const current = await read(file);
+        if (current.exists) await write(file, [], true);
+        onChange();
+      });
+    },
+    record(event) {
+      const current = settings.value;
+      if (!current.enabled) return;
+      const entry = normalize(event);
+      if (!entry) return;
+      if (pending.length === BATCH_LIMIT) pending.shift();
+      pending.push({ file: current.path, event: entry });
+      if (!timer) {
+        timer = setTimeout(() => {
+          void flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));
+        }, 175);
+      }
+    },
+    flush,
+  };
+}
+
+module.exports = { createLoginLog };
+  };
+  factories["./i18n.cjs"] = function (require, module, exports) {
+const en = {
+  title: "Remote Access",
+  description: "Manage remote listening, sign-in credentials, and live connections.",
+  configuration: "Configuration",
+  allowedSources: "Source IP allowlist",
+  allowedSourcesHelp: "Enter IP addresses or CIDR ranges separated by commas or spaces. Leave blank to allow any source.",
+  blocked: "Blocked",
+  methodBlocked: "IP allowlist",
+  "error.allowlist": "Enter valid IP addresses or CIDR ranges.",
+  listenAddress: "Listen address",
+  listenAddressHelp: "Choose an IP address assigned to this computer and an available port.",
+  listenAddressHint: "OpenCode Desktop uses port {{port}}. Choose a different port for remote access.",
+  listenAddressConflict: "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
+  ipAddress: "IP address",
+  localIp: "Local IP",
+  port: "Port",
+  credentials: "Sign-in credentials",
+  credentialsHelp: "Save for the next start, or save and restart the listener to apply changes now.",
+  username: "Username",
+  password: "Password",
+  revealPassword: "Show password",
+  hidePassword: "Hide password",
+  save: "Save",
+  saveRestart: "Save and restart",
+  saveSuccess: "Settings saved.",
+  restartSuccess: "Listener restarted with the saved settings.",
+  pending: "Saved changes will apply the next time the listener starts.",
+  listener: "Listener",
+  listenerStatus: "Listener status",
+  restarting: "Restarting…",
+  listening: "Listening",
+  stopped: "Stopped",
+  listenerHelp: "Start the listener to connect from another device that can reach this address.",
+  start: "Start listener",
+  stop: "Stop listener",
+  openBrowser: "Open in browser",
+  generateQr: "Generate pairing QR code",
+  cameraQr: "Camera",
+  appQr: "OpenCode App",
+  pairingHint: "Scan with the OpenCode app or your camera, or open the one-time link in a browser. It expires in 5 minutes.",
+  pairingCountdown: "Expires in {{time}}",
+  pairingExpired: "Pairing link expired",
+  pairingExpiredHint: "Generate a new QR code to pair.",
+  connections: "Current connections",
+  noConnections: "No active connections",
+  noConnectionsHelp: "Connected devices appear here by source IP.",
+  thisComputer: "This computer",
+  unknownDevice: "Unknown device",
+  connectionCount: "{{count}} connections",
+  connectionCountOne: "1 connection",
+  deviceAliases: "Device aliases",
+  noAliases: "No device aliases",
+  noAliasesHelp: "Add an alias from a current connection or sign-in log entry.",
+  setAlias: "Set alias",
+  editAlias: "Edit alias",
+  removeAlias: "Remove alias",
+  aliasLabel: "Alias",
+  signInLogs: "Sign-in log",
+  noLogs: "No sign-in attempts recorded",
+  clearLogs: "Clear log",
+  clearLogsConfirm: "Clear sign-in log?",
+  clearLogsDescription: "This removes the recorded sign-in attempts for this installation.",
+  clear: "Clear",
+  cancel: "Cancel",
+  showMore: "Show more",
+  success: "Success",
+  rejected: "Rejected",
+  methodBasic: "Password",
+  methodPair: "Pairing",
+  viewLogs: "View log",
+  hideLogs: "Hide log",
+  logRecording: "Record sign-ins",
+  logRecordingHelp: "Record successful and rejected sign-ins in the local log file.",
+  logPath: "Log file",
+  fileSize: "File size: {{size}}",
+  applyLogPath: "Save log path",
+  openLogFile: "Open log file",
+  "error.aliasSaveFailed": "Could not save the device alias.",
+  "error.startFailed": "Could not start the remote listener.",
+  "error.browserFailed": "Could not open the browser.",
+  "error.logPath": "Enter an absolute file path.",
+  "error.logFile": "Choose a new file or an existing OpenCode Remote Access log.",
+  "error.logTooLarge": "The log exceeds 1 MiB. Choose another log file.",
+  "error.logOpen": "Could not open the log file.",
+  "error.logSave": "Could not save the log.",
+  dateLocale: "en",
+  "error.invalidIp": "Enter a specific IPv4 address to listen on.",
+  "error.invalidPort": "Enter a whole-number port between 1 and 65535.",
+  "error.invalidUsername": "Enter a username without colons or control characters.",
+  "error.invalidPassword": "Enter a password without control characters.",
+  "error.credentialsTooLong": "Usernames can be up to 256 bytes and passwords up to 1024 bytes.",
+  "error.pluginClosing": "The remote access plugin is shutting down.",
+  "error.configRead": "Could not read remote.json. Check the file or save the settings again.",
+  "error.portConflict": "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
+  "error.sidecarNotReady": "The local OpenCode service is not ready.",
+  "error.ipNotAssigned": "This IP address is not assigned to the computer. Check your network or VPN.",
+  "error.portInUse": "Port {{port}} is already in use. Choose a different port.",
+  "error.ipUnavailable": "The listen address is unavailable. Check your network or VPN.",
+  "error.portPermission": "Permission denied for port {{port}}.",
+  "error.restoreFailed": "The previous listener could not be restored. Check the address and port, then start it again.",
+  "error.listenerStopped": "Start the remote listener first.",
+  "error.pairFailed": "Could not generate a pairing code. Check the local OpenCode service.",
+  "error.pairAddressMismatch": "The pairing link did not match the active listener.",
+  "error.invalidDeviceId": "The device identifier is invalid.",
+  "error.invalidDeviceAlias": "Enter a shorter alias without control characters.",
+  "error.aliasLimit": "Remove an existing device alias before adding another.",
+  "error.saveFailed": "Could not save remote access settings.",
+};
+
+const zh = {
+  title: "远程访问",
+  description: "管理远程监听、登录凭据与实时连接。",
+  configuration: "配置",
+  allowedSources: "来源 IP 白名单",
+  allowedSourcesHelp: "支持单个 IP 和 CIDR 网段，用逗号或空格分隔。留空允许任意来源。",
+  blocked: "被拦截",
+  methodBlocked: "IP 白名单",
+  "error.allowlist": "请输入有效的 IP 地址或 CIDR 网段。",
+  listenAddress: "监听地址",
+  listenAddressHelp: "填写本机网络接口的 IP 地址和可用端口。",
+  listenAddressHint: "桌面服务使用端口 {{port}}，请为远程入口选择其他端口。",
+  listenAddressConflict: "端口 {{port}} 已由桌面服务使用，请换一个端口。",
+  ipAddress: "IP 地址",
+  localIp: "本机 IP",
+  port: "端口",
+  credentials: "登录凭据",
+  credentialsHelp: "保存后在下次启动时生效，也可以保存并重启监听立即应用。",
+  username: "账号",
+  password: "密码",
+  revealPassword: "显示密码",
+  hidePassword: "隐藏密码",
+  save: "保存",
+  saveRestart: "保存并重启",
+  saveSuccess: "设置已保存。",
+  restartSuccess: "监听已使用保存的设置重新启动。",
+  pending: "已保存的改动将在下次启动监听时生效。",
+  listener: "监听",
+  listenerStatus: "监听状态",
+  restarting: "重启中…",
+  listening: "正在监听",
+  stopped: "未监听",
+  listenerHelp: "启动后可从能访问此地址的设备连接。",
+  start: "启动监听",
+  stop: "停止监听",
+  openBrowser: "在浏览器中打开",
+  generateQr: "生成配对二维码",
+  cameraQr: "相机",
+  appQr: "OpenCode App",
+  pairingHint: "用 OpenCode App 或相机扫码，或在浏览器打开一次性链接。有效期 5 分钟。",
+  pairingCountdown: "剩余 {{time}}",
+  pairingExpired: "配对链接已过期",
+  pairingExpiredHint: "请生成新的二维码进行配对。",
+  connections: "当前连接",
+  noConnections: "暂无连接",
+  noConnectionsHelp: "连接建立后会按来源 IP 显示在这里。",
+  thisComputer: "本机",
+  unknownDevice: "未知设备",
+  connectionCount: "{{count}} 个连接",
+  connectionCountOne: "1 个连接",
+  deviceAliases: "设备别名",
+  noAliases: "暂无设备别名",
+  noAliasesHelp: "可从当前连接或登录日志为设备添加别名。",
+  setAlias: "设置别名",
+  editAlias: "编辑别名",
+  removeAlias: "删除别名",
+  aliasLabel: "别名",
+  signInLogs: "登录日志",
+  noLogs: "暂无登录记录",
+  clearLogs: "清空日志",
+  clearLogsConfirm: "清空登录日志？",
+  clearLogsDescription: "将删除此插件记录的登录尝试。",
+  clear: "清空",
+  cancel: "取消",
+  showMore: "查看更多",
+  success: "成功",
+  rejected: "拒绝",
+  methodBasic: "密码",
+  methodPair: "配对",
+  viewLogs: "查看日志",
+  hideLogs: "收起日志",
+  logRecording: "记录登录日志",
+  logRecordingHelp: "将成功和被拒绝的登录记录写入本地日志文件。",
+  logPath: "日志文件",
+  fileSize: "文件大小 {{size}}",
+  applyLogPath: "保存日志路径",
+  openLogFile: "打开日志文件",
+  "error.aliasSaveFailed": "无法保存设备别名。",
+  "error.startFailed": "无法启动远程监听。",
+  "error.browserFailed": "无法打开浏览器。",
+  "error.logPath": "请输入绝对文件路径。",
+  "error.logFile": "请选择一个新文件或已有的 OpenCode 远程访问日志。",
+  "error.logTooLarge": "日志超过 1 MiB，请选择另一个日志文件。",
+  "error.logOpen": "无法打开日志文件。",
+  "error.logSave": "无法保存日志。",
+  dateLocale: "zh-CN",
+  "error.invalidIp": "请输入要监听的具体 IPv4 地址。",
+  "error.invalidPort": "请输入 1 至 65535 之间的整数端口。",
+  "error.invalidUsername": "账号不能为空，且不能包含冒号或控制字符。",
+  "error.invalidPassword": "密码不能为空，且不能包含控制字符。",
+  "error.credentialsTooLong": "账号和密码分别不能超过 256 字节和 1024 字节。",
+  "error.pluginClosing": "远程访问插件正在关闭。",
+  "error.configRead": "无法读取 remote.json，请检查文件或重新保存设置。",
+  "error.portConflict": "端口 {{port}} 已由桌面服务使用，请换一个端口。",
+  "error.sidecarNotReady": "OpenCode 本机服务尚未就绪。",
+  "error.ipNotAssigned": "该 IP 地址没有分配给本机，请检查网络或 VPN。",
+  "error.portInUse": "端口 {{port}} 已被占用，请选择其他端口。",
+  "error.ipUnavailable": "监听地址不可用，请检查网络或 VPN。",
+  "error.portPermission": "没有权限监听端口 {{port}}。",
+  "error.restoreFailed": "无法恢复原监听，请检查地址与端口后重新启动监听。",
+  "error.listenerStopped": "请先启动远程监听。",
+  "error.pairFailed": "无法生成配对码，请检查 OpenCode 本机服务。",
+  "error.pairAddressMismatch": "配对链接与当前监听地址不一致。",
+  "error.invalidDeviceId": "设备标识无效。",
+  "error.invalidDeviceAlias": "请输入较短且不包含控制字符的别名。",
+  "error.aliasLimit": "请先删除一个已有的设备别名。",
+  "error.saveFailed": "无法保存远程访问设置。",
+};
+
+module.exports = { i18n: { en, "zh-Hans": zh } };
+  };
+  factories["./pairing.cjs"] = function (require, module, exports) {
+const { createComponent, createSignal, onCleanup } = require("solid-js");
+const { insert } = require("solid-js/web");
+const qrcode = require("./qrcode-generator.cjs");
+
+const scale = 5;
+const margin = 4;
+
+function makeCanvas(width, height, label, paint) {
+  const canvas = document.createElement("canvas");
+  canvas.width = (width + margin * 2) * scale;
+  canvas.height = (height + margin * 2) * scale;
+  canvas.style.cssText = "max-width:100%;height:auto";
+  canvas.setAttribute("aria-label", label);
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#000";
+  paint((x, y) => context.fillRect((x + margin) * scale, (y + margin) * scale, scale, scale));
+  return canvas;
+}
+
+function cameraCanvas(link, label) {
+  const code = qrcode(0, "M");
+  code.addData(link);
+  code.make();
+  const modules = code.getModuleCount();
+  return makeCanvas(modules, modules, label, (pixel) => {
+    for (let y = 0; y < modules; y++) {
+      for (let x = 0; x < modules; x++) {
+        if (code.isDark(y, x)) pixel(x, y);
+      }
+    }
+  });
+}
+
+function nativeCanvas(output, label) {
+  const rows = output.split(/\r?\n/).filter((line) => /^[ █▀▄]+$/.test(line) && /[█▀▄]/.test(line));
+  if (!rows.length) return undefined;
+  return makeCanvas(Math.max(...rows.map((line) => line.length)), rows.length * 2, label, (pixel) => {
+    rows.forEach((line, y) => Array.from(line).forEach((symbol, x) => {
+      if (symbol === "█" || symbol === "▀") pixel(x, y * 2);
+      if (symbol === "█" || symbol === "▄") pixel(x, y * 2 + 1);
+    }));
+  });
+}
+
+function secondsUntil(expiresAt, now = Date.now()) {
+  return Math.max(0, Math.ceil((expiresAt - now) / 1000));
+}
+
+function remainingText(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainder = String(seconds % 60).padStart(2, "0");
+  return `${minutes}:${remainder}`;
+}
+
+function pairingPreview({ output, expiresAt }, t, ui) {
+  const link = output.match(/https?:\/\/[^\s]+\/auth\/connect\/[A-Za-z0-9_-]{22}(?=\s|$)/u)?.[0];
+  const camera = link ? cameraCanvas(link, t("cameraQr")) : undefined;
+  const app = nativeCanvas(output, t("appQr"));
+  const [mode, setMode] = createSignal(camera ? "camera" : "app");
+  const [remaining, setRemaining] = createSignal(secondsUntil(expiresAt));
+  const expired = () => remaining() <= 0;
+  if (!expired()) {
+    const timer = setInterval(() => {
+      setRemaining(secondsUntil(expiresAt));
+      if (expired()) clearInterval(timer);
+    }, 250);
+    onCleanup(() => clearInterval(timer));
+  }
+
+  const root = document.createElement("div");
+  root.style.cssText = "padding:16px 20px;display:grid;gap:8px;overflow-wrap:anywhere;user-select:text";
+  const controls = document.createElement("div");
+  controls.style.cssText = "display:flex;align-items:center;flex-wrap:wrap;gap:6px";
+  const timer = document.createElement("span");
+  timer.setAttribute("role", "timer");
+  timer.style.cssText = "color:var(--v2-text-text-muted);font-variant-numeric:tabular-nums";
+  insert(timer, () => expired() ? t("pairingExpired") : t("pairingCountdown", { time: remainingText(remaining()) }));
+  const modeButton = (value, key) => createComponent(ui.Button, {
+    size: "small",
+    get variant() { return mode() === value ? "neutral" : "ghost"; },
+    get children() { return t(key); },
+    onClick: () => setMode(value),
+  });
+  insert(controls, [
+    () => !expired() && camera && app
+      ? [modeButton("camera", "cameraQr"), modeButton("app", "appQr")]
+      : null,
+    timer,
+  ]);
+  const visual = document.createElement("div");
+  const covered = document.createElement("div");
+  covered.style.cssText = "display:grid;place-items:center;width:min(220px,100%);min-height:100px;border-radius:6px;background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted)";
+  insert(covered, () => t("pairingExpired"));
+  insert(visual, () => expired() ? covered : mode() === "camera" ? camera : app);
+  const note = document.createElement("p");
+  insert(note, () => t(expired() ? "pairingExpiredHint" : "pairingHint"));
+  root.append(controls, visual, note);
+  if (link) {
+    const address = document.createElement("p");
+    const strike = document.createElement("s");
+    strike.textContent = link;
+    strike.style.color = "var(--v2-text-text-muted)";
+    insert(address, () => expired() ? strike : link);
+    root.append(address);
+  }
+  return root;
+}
+
+module.exports = { pairingPreview, secondsUntil, remainingText };
+  };
+  factories["./qrcode-generator.cjs"] = function (require, module, exports) {
+//---------------------------------------------------------------------
+//
+// QR Code Generator for JavaScript
+//
+// Copyright (c) 2009 Kazuhiko Arase
+//
+// URL: http://www.d-project.com/
+//
+// Licensed under the MIT license:
+//  http://www.opensource.org/licenses/mit-license.php
+//
+// The word 'QR Code' is registered trademark of
+// DENSO WAVE INCORPORATED
+//  http://www.denso-wave.com/qrcode/faqpatent-e.html
+//
+//---------------------------------------------------------------------
+
+var qrcode = function() {
+
+  //---------------------------------------------------------------------
+  // qrcode
+  //---------------------------------------------------------------------
+
+  /**
+   * qrcode
+   * @param typeNumber 1 to 40
+   * @param errorCorrectionLevel 'L','M','Q','H'
+   */
+  var qrcode = function(typeNumber, errorCorrectionLevel) {
+
+    var PAD0 = 0xEC;
+    var PAD1 = 0x11;
+
+    var _typeNumber = typeNumber;
+    var _errorCorrectionLevel = QRErrorCorrectionLevel[errorCorrectionLevel];
+    var _modules = null;
+    var _moduleCount = 0;
+    var _dataCache = null;
+    var _dataList = [];
+
+    var _this = {};
+
+    var makeImpl = function(test, maskPattern) {
+
+      _moduleCount = _typeNumber * 4 + 17;
+      _modules = function(moduleCount) {
+        var modules = new Array(moduleCount);
+        for (var row = 0; row < moduleCount; row += 1) {
+          modules[row] = new Array(moduleCount);
+          for (var col = 0; col < moduleCount; col += 1) {
+            modules[row][col] = null;
+          }
+        }
+        return modules;
+      }(_moduleCount);
+
+      setupPositionProbePattern(0, 0);
+      setupPositionProbePattern(_moduleCount - 7, 0);
+      setupPositionProbePattern(0, _moduleCount - 7);
+      setupPositionAdjustPattern();
+      setupTimingPattern();
+      setupTypeInfo(test, maskPattern);
+
+      if (_typeNumber >= 7) {
+        setupTypeNumber(test);
+      }
+
+      if (_dataCache == null) {
+        _dataCache = createData(_typeNumber, _errorCorrectionLevel, _dataList);
+      }
+
+      mapData(_dataCache, maskPattern);
+    };
+
+    var setupPositionProbePattern = function(row, col) {
+
+      for (var r = -1; r <= 7; r += 1) {
+
+        if (row + r <= -1 || _moduleCount <= row + r) continue;
+
+        for (var c = -1; c <= 7; c += 1) {
+
+          if (col + c <= -1 || _moduleCount <= col + c) continue;
+
+          if ( (0 <= r && r <= 6 && (c == 0 || c == 6) )
+              || (0 <= c && c <= 6 && (r == 0 || r == 6) )
+              || (2 <= r && r <= 4 && 2 <= c && c <= 4) ) {
+            _modules[row + r][col + c] = true;
+          } else {
+            _modules[row + r][col + c] = false;
+          }
+        }
+      }
+    };
+
+    var getBestMaskPattern = function() {
+
+      var minLostPoint = 0;
+      var pattern = 0;
+
+      for (var i = 0; i < 8; i += 1) {
+
+        makeImpl(true, i);
+
+        var lostPoint = QRUtil.getLostPoint(_this);
+
+        if (i == 0 || minLostPoint > lostPoint) {
+          minLostPoint = lostPoint;
+          pattern = i;
+        }
+      }
+
+      return pattern;
+    };
+
+    var setupTimingPattern = function() {
+
+      for (var r = 8; r < _moduleCount - 8; r += 1) {
+        if (_modules[r][6] != null) {
+          continue;
+        }
+        _modules[r][6] = (r % 2 == 0);
+      }
+
+      for (var c = 8; c < _moduleCount - 8; c += 1) {
+        if (_modules[6][c] != null) {
+          continue;
+        }
+        _modules[6][c] = (c % 2 == 0);
+      }
+    };
+
+    var setupPositionAdjustPattern = function() {
+
+      var pos = QRUtil.getPatternPosition(_typeNumber);
+
+      for (var i = 0; i < pos.length; i += 1) {
+
+        for (var j = 0; j < pos.length; j += 1) {
+
+          var row = pos[i];
+          var col = pos[j];
+
+          if (_modules[row][col] != null) {
+            continue;
+          }
+
+          for (var r = -2; r <= 2; r += 1) {
+
+            for (var c = -2; c <= 2; c += 1) {
+
+              if (r == -2 || r == 2 || c == -2 || c == 2
+                  || (r == 0 && c == 0) ) {
+                _modules[row + r][col + c] = true;
+              } else {
+                _modules[row + r][col + c] = false;
+              }
+            }
+          }
+        }
+      }
+    };
+
+    var setupTypeNumber = function(test) {
+
+      var bits = QRUtil.getBCHTypeNumber(_typeNumber);
+
+      for (var i = 0; i < 18; i += 1) {
+        var mod = (!test && ( (bits >> i) & 1) == 1);
+        _modules[Math.floor(i / 3)][i % 3 + _moduleCount - 8 - 3] = mod;
+      }
+
+      for (var i = 0; i < 18; i += 1) {
+        var mod = (!test && ( (bits >> i) & 1) == 1);
+        _modules[i % 3 + _moduleCount - 8 - 3][Math.floor(i / 3)] = mod;
+      }
+    };
+
+    var setupTypeInfo = function(test, maskPattern) {
+
+      var data = (_errorCorrectionLevel << 3) | maskPattern;
+      var bits = QRUtil.getBCHTypeInfo(data);
+
+      // vertical
+      for (var i = 0; i < 15; i += 1) {
+
+        var mod = (!test && ( (bits >> i) & 1) == 1);
+
+        if (i < 6) {
+          _modules[i][8] = mod;
+        } else if (i < 8) {
+          _modules[i + 1][8] = mod;
+        } else {
+          _modules[_moduleCount - 15 + i][8] = mod;
+        }
+      }
+
+      // horizontal
+      for (var i = 0; i < 15; i += 1) {
+
+        var mod = (!test && ( (bits >> i) & 1) == 1);
+
+        if (i < 8) {
+          _modules[8][_moduleCount - i - 1] = mod;
+        } else if (i < 9) {
+          _modules[8][15 - i - 1 + 1] = mod;
+        } else {
+          _modules[8][15 - i - 1] = mod;
+        }
+      }
+
+      // fixed module
+      _modules[_moduleCount - 8][8] = (!test);
+    };
+
+    var mapData = function(data, maskPattern) {
+
+      var inc = -1;
+      var row = _moduleCount - 1;
+      var bitIndex = 7;
+      var byteIndex = 0;
+      var maskFunc = QRUtil.getMaskFunction(maskPattern);
+
+      for (var col = _moduleCount - 1; col > 0; col -= 2) {
+
+        if (col == 6) col -= 1;
+
+        while (true) {
+
+          for (var c = 0; c < 2; c += 1) {
+
+            if (_modules[row][col - c] == null) {
+
+              var dark = false;
+
+              if (byteIndex < data.length) {
+                dark = ( ( (data[byteIndex] >>> bitIndex) & 1) == 1);
+              }
+
+              var mask = maskFunc(row, col - c);
+
+              if (mask) {
+                dark = !dark;
+              }
+
+              _modules[row][col - c] = dark;
+              bitIndex -= 1;
+
+              if (bitIndex == -1) {
+                byteIndex += 1;
+                bitIndex = 7;
+              }
+            }
+          }
+
+          row += inc;
+
+          if (row < 0 || _moduleCount <= row) {
+            row -= inc;
+            inc = -inc;
+            break;
+          }
+        }
+      }
+    };
+
+    var createBytes = function(buffer, rsBlocks) {
+
+      var offset = 0;
+
+      var maxDcCount = 0;
+      var maxEcCount = 0;
+
+      var dcdata = new Array(rsBlocks.length);
+      var ecdata = new Array(rsBlocks.length);
+
+      for (var r = 0; r < rsBlocks.length; r += 1) {
+
+        var dcCount = rsBlocks[r].dataCount;
+        var ecCount = rsBlocks[r].totalCount - dcCount;
+
+        maxDcCount = Math.max(maxDcCount, dcCount);
+        maxEcCount = Math.max(maxEcCount, ecCount);
+
+        dcdata[r] = new Array(dcCount);
+
+        for (var i = 0; i < dcdata[r].length; i += 1) {
+          dcdata[r][i] = 0xff & buffer.getBuffer()[i + offset];
+        }
+        offset += dcCount;
+
+        var rsPoly = QRUtil.getErrorCorrectPolynomial(ecCount);
+        var rawPoly = qrPolynomial(dcdata[r], rsPoly.getLength() - 1);
+
+        var modPoly = rawPoly.mod(rsPoly);
+        ecdata[r] = new Array(rsPoly.getLength() - 1);
+        for (var i = 0; i < ecdata[r].length; i += 1) {
+          var modIndex = i + modPoly.getLength() - ecdata[r].length;
+          ecdata[r][i] = (modIndex >= 0)? modPoly.getAt(modIndex) : 0;
+        }
+      }
+
+      var totalCodeCount = 0;
+      for (var i = 0; i < rsBlocks.length; i += 1) {
+        totalCodeCount += rsBlocks[i].totalCount;
+      }
+
+      var data = new Array(totalCodeCount);
+      var index = 0;
+
+      for (var i = 0; i < maxDcCount; i += 1) {
+        for (var r = 0; r < rsBlocks.length; r += 1) {
+          if (i < dcdata[r].length) {
+            data[index] = dcdata[r][i];
+            index += 1;
+          }
+        }
+      }
+
+      for (var i = 0; i < maxEcCount; i += 1) {
+        for (var r = 0; r < rsBlocks.length; r += 1) {
+          if (i < ecdata[r].length) {
+            data[index] = ecdata[r][i];
+            index += 1;
+          }
+        }
+      }
+
+      return data;
+    };
+
+    var createData = function(typeNumber, errorCorrectionLevel, dataList) {
+
+      var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, errorCorrectionLevel);
+
+      var buffer = qrBitBuffer();
+
+      for (var i = 0; i < dataList.length; i += 1) {
+        var data = dataList[i];
+        buffer.put(data.getMode(), 4);
+        buffer.put(data.getLength(), QRUtil.getLengthInBits(data.getMode(), typeNumber) );
+        data.write(buffer);
+      }
+
+      // calc num max data.
+      var totalDataCount = 0;
+      for (var i = 0; i < rsBlocks.length; i += 1) {
+        totalDataCount += rsBlocks[i].dataCount;
+      }
+
+      if (buffer.getLengthInBits() > totalDataCount * 8) {
+        throw 'code length overflow. ('
+          + buffer.getLengthInBits()
+          + '>'
+          + totalDataCount * 8
+          + ')';
+      }
+
+      // end code
+      if (buffer.getLengthInBits() + 4 <= totalDataCount * 8) {
+        buffer.put(0, 4);
+      }
+
+      // padding
+      while (buffer.getLengthInBits() % 8 != 0) {
+        buffer.putBit(false);
+      }
+
+      // padding
+      while (true) {
+
+        if (buffer.getLengthInBits() >= totalDataCount * 8) {
+          break;
+        }
+        buffer.put(PAD0, 8);
+
+        if (buffer.getLengthInBits() >= totalDataCount * 8) {
+          break;
+        }
+        buffer.put(PAD1, 8);
+      }
+
+      return createBytes(buffer, rsBlocks);
+    };
+
+    _this.addData = function(data, mode) {
+
+      mode = mode || 'Byte';
+
+      var newData = null;
+
+      switch(mode) {
+      case 'Numeric' :
+        newData = qrNumber(data);
+        break;
+      case 'Alphanumeric' :
+        newData = qrAlphaNum(data);
+        break;
+      case 'Byte' :
+        newData = qr8BitByte(data);
+        break;
+      case 'Kanji' :
+        newData = qrKanji(data);
+        break;
+      default :
+        throw 'mode:' + mode;
+      }
+
+      _dataList.push(newData);
+      _dataCache = null;
+    };
+
+    _this.isDark = function(row, col) {
+      if (row < 0 || _moduleCount <= row || col < 0 || _moduleCount <= col) {
+        throw row + ',' + col;
+      }
+      return _modules[row][col];
+    };
+
+    _this.getModuleCount = function() {
+      return _moduleCount;
+    };
+
+    _this.make = function() {
+      if (_typeNumber < 1) {
+        var typeNumber = 1;
+
+        for (; typeNumber < 40; typeNumber++) {
+          var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, _errorCorrectionLevel);
+          var buffer = qrBitBuffer();
+
+          for (var i = 0; i < _dataList.length; i++) {
+            var data = _dataList[i];
+            buffer.put(data.getMode(), 4);
+            buffer.put(data.getLength(), QRUtil.getLengthInBits(data.getMode(), typeNumber) );
+            data.write(buffer);
+          }
+
+          var totalDataCount = 0;
+          for (var i = 0; i < rsBlocks.length; i++) {
+            totalDataCount += rsBlocks[i].dataCount;
+          }
+
+          if (buffer.getLengthInBits() <= totalDataCount * 8) {
+            break;
+          }
+        }
+
+        _typeNumber = typeNumber;
+      }
+
+      makeImpl(false, getBestMaskPattern() );
+    };
+
+    _this.createTableTag = function(cellSize, margin) {
+
+      cellSize = cellSize || 2;
+      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
+
+      var qrHtml = '';
+
+      qrHtml += '<table style="';
+      qrHtml += ' border-width: 0px; border-style: none;';
+      qrHtml += ' border-collapse: collapse;';
+      qrHtml += ' padding: 0px; margin: ' + margin + 'px;';
+      qrHtml += '">';
+      qrHtml += '<tbody>';
+
+      for (var r = 0; r < _this.getModuleCount(); r += 1) {
+
+        qrHtml += '<tr>';
+
+        for (var c = 0; c < _this.getModuleCount(); c += 1) {
+          qrHtml += '<td style="';
+          qrHtml += ' border-width: 0px; border-style: none;';
+          qrHtml += ' border-collapse: collapse;';
+          qrHtml += ' padding: 0px; margin: 0px;';
+          qrHtml += ' width: ' + cellSize + 'px;';
+          qrHtml += ' height: ' + cellSize + 'px;';
+          qrHtml += ' background-color: ';
+          qrHtml += _this.isDark(r, c)? '#000000' : '#ffffff';
+          qrHtml += ';';
+          qrHtml += '"/>';
+        }
+
+        qrHtml += '</tr>';
+      }
+
+      qrHtml += '</tbody>';
+      qrHtml += '</table>';
+
+      return qrHtml;
+    };
+
+    _this.createSvgTag = function(cellSize, margin, alt, title) {
+
+      var opts = {};
+      if (typeof arguments[0] == 'object') {
+        // Called by options.
+        opts = arguments[0];
+        // overwrite cellSize and margin.
+        cellSize = opts.cellSize;
+        margin = opts.margin;
+        alt = opts.alt;
+        title = opts.title;
+      }
+
+      cellSize = cellSize || 2;
+      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
+
+      // Compose alt property surrogate
+      alt = (typeof alt === 'string') ? {text: alt} : alt || {};
+      alt.text = alt.text || null;
+      alt.id = (alt.text) ? alt.id || 'qrcode-description' : null;
+
+      // Compose title property surrogate
+      title = (typeof title === 'string') ? {text: title} : title || {};
+      title.text = title.text || null;
+      title.id = (title.text) ? title.id || 'qrcode-title' : null;
+
+      var size = _this.getModuleCount() * cellSize + margin * 2;
+      var c, mc, r, mr, qrSvg='', rect;
+
+      rect = 'l' + cellSize + ',0 0,' + cellSize +
+        ' -' + cellSize + ',0 0,-' + cellSize + 'z ';
+
+      qrSvg += '<svg version="1.1" xmlns="http://www.w3.org/2000/svg"';
+      qrSvg += !opts.scalable ? ' width="' + size + 'px" height="' + size + 'px"' : '';
+      qrSvg += ' viewBox="0 0 ' + size + ' ' + size + '" ';
+      qrSvg += ' preserveAspectRatio="xMinYMin meet"';
+      qrSvg += (title.text || alt.text) ? ' role="img" aria-labelledby="' +
+          escapeXml([title.id, alt.id].join(' ').trim() ) + '"' : '';
+      qrSvg += '>';
+      qrSvg += (title.text) ? '<title id="' + escapeXml(title.id) + '">' +
+          escapeXml(title.text) + '</title>' : '';
+      qrSvg += (alt.text) ? '<description id="' + escapeXml(alt.id) + '">' +
+          escapeXml(alt.text) + '</description>' : '';
+      qrSvg += '<rect width="100%" height="100%" fill="white" cx="0" cy="0"/>';
+      qrSvg += '<path d="';
+
+      for (r = 0; r < _this.getModuleCount(); r += 1) {
+        mr = r * cellSize + margin;
+        for (c = 0; c < _this.getModuleCount(); c += 1) {
+          if (_this.isDark(r, c) ) {
+            mc = c*cellSize+margin;
+            qrSvg += 'M' + mc + ',' + mr + rect;
+          }
+        }
+      }
+
+      qrSvg += '" stroke="transparent" fill="black"/>';
+      qrSvg += '</svg>';
+
+      return qrSvg;
+    };
+
+    _this.createDataURL = function(cellSize, margin) {
+
+      cellSize = cellSize || 2;
+      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
+
+      var size = _this.getModuleCount() * cellSize + margin * 2;
+      var min = margin;
+      var max = size - margin;
+
+      return createDataURL(size, size, function(x, y) {
+        if (min <= x && x < max && min <= y && y < max) {
+          var c = Math.floor( (x - min) / cellSize);
+          var r = Math.floor( (y - min) / cellSize);
+          return _this.isDark(r, c)? 0 : 1;
+        } else {
+          return 1;
+        }
+      } );
+    };
+
+    _this.createImgTag = function(cellSize, margin, alt) {
+
+      cellSize = cellSize || 2;
+      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
+
+      var size = _this.getModuleCount() * cellSize + margin * 2;
+
+      var img = '';
+      img += '<img';
+      img += '\u0020src="';
+      img += _this.createDataURL(cellSize, margin);
+      img += '"';
+      img += '\u0020width="';
+      img += size;
+      img += '"';
+      img += '\u0020height="';
+      img += size;
+      img += '"';
+      if (alt) {
+        img += '\u0020alt="';
+        img += escapeXml(alt);
+        img += '"';
+      }
+      img += '/>';
+
+      return img;
+    };
+
+    var escapeXml = function(s) {
+      var escaped = '';
+      for (var i = 0; i < s.length; i += 1) {
+        var c = s.charAt(i);
+        switch(c) {
+        case '<': escaped += '&lt;'; break;
+        case '>': escaped += '&gt;'; break;
+        case '&': escaped += '&amp;'; break;
+        case '"': escaped += '&quot;'; break;
+        default : escaped += c; break;
+        }
+      }
+      return escaped;
+    };
+
+    var _createHalfASCII = function(margin) {
+      var cellSize = 1;
+      margin = (typeof margin == 'undefined')? cellSize * 2 : margin;
+
+      var size = _this.getModuleCount() * cellSize + margin * 2;
+      var min = margin;
+      var max = size - margin;
+
+      var y, x, r1, r2, p;
+
+      var blocks = {
+        '██': '█',
+        '█ ': '▀',
+        ' █': '▄',
+        '  ': ' '
+      };
+
+      var blocksLastLineNoMargin = {
+        '██': '▀',
+        '█ ': '▀',
+        ' █': ' ',
+        '  ': ' '
+      };
+
+      var ascii = '';
+      for (y = 0; y < size; y += 2) {
+        r1 = Math.floor((y - min) / cellSize);
+        r2 = Math.floor((y + 1 - min) / cellSize);
+        for (x = 0; x < size; x += 1) {
+          p = '█';
+
+          if (min <= x && x < max && min <= y && y < max && _this.isDark(r1, Math.floor((x - min) / cellSize))) {
+            p = ' ';
+          }
+
+          if (min <= x && x < max && min <= y+1 && y+1 < max && _this.isDark(r2, Math.floor((x - min) / cellSize))) {
+            p += ' ';
+          }
+          else {
+            p += '█';
+          }
+
+          // Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
+          ascii += (margin < 1 && y+1 >= max) ? blocksLastLineNoMargin[p] : blocks[p];
+        }
+
+        ascii += '\n';
+      }
+
+      if (size % 2 && margin > 0) {
+        return ascii.substring(0, ascii.length - size - 1) + Array(size+1).join('▀');
+      }
+
+      return ascii.substring(0, ascii.length-1);
+    };
+
+    _this.createASCII = function(cellSize, margin) {
+      cellSize = cellSize || 1;
+
+      if (cellSize < 2) {
+        return _createHalfASCII(margin);
+      }
+
+      cellSize -= 1;
+      margin = (typeof margin == 'undefined')? cellSize * 2 : margin;
+
+      var size = _this.getModuleCount() * cellSize + margin * 2;
+      var min = margin;
+      var max = size - margin;
+
+      var y, x, r, p;
+
+      var white = Array(cellSize+1).join('██');
+      var black = Array(cellSize+1).join('  ');
+
+      var ascii = '';
+      var line = '';
+      for (y = 0; y < size; y += 1) {
+        r = Math.floor( (y - min) / cellSize);
+        line = '';
+        for (x = 0; x < size; x += 1) {
+          p = 1;
+
+          if (min <= x && x < max && min <= y && y < max && _this.isDark(r, Math.floor((x - min) / cellSize))) {
+            p = 0;
+          }
+
+          // Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
+          line += p ? white : black;
+        }
+
+        for (r = 0; r < cellSize; r += 1) {
+          ascii += line + '\n';
+        }
+      }
+
+      return ascii.substring(0, ascii.length-1);
+    };
+
+    _this.renderTo2dContext = function(context, cellSize) {
+      cellSize = cellSize || 2;
+      var length = _this.getModuleCount();
+      for (var row = 0; row < length; row++) {
+        for (var col = 0; col < length; col++) {
+          context.fillStyle = _this.isDark(row, col) ? 'black' : 'white';
+          context.fillRect(col * cellSize, row * cellSize, cellSize, cellSize);
+        }
+      }
+    }
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // qrcode.stringToBytes
+  //---------------------------------------------------------------------
+
+  qrcode.stringToBytesFuncs = {
+    'default' : function(s) {
+      var bytes = [];
+      for (var i = 0; i < s.length; i += 1) {
+        var c = s.charCodeAt(i);
+        bytes.push(c & 0xff);
+      }
+      return bytes;
+    }
+  };
+
+  qrcode.stringToBytes = qrcode.stringToBytesFuncs['default'];
+
+  //---------------------------------------------------------------------
+  // qrcode.createStringToBytes
+  //---------------------------------------------------------------------
+
+  /**
+   * @param unicodeData base64 string of byte array.
+   * [16bit Unicode],[16bit Bytes], ...
+   * @param numChars
+   */
+  qrcode.createStringToBytes = function(unicodeData, numChars) {
+
+    // create conversion map.
+
+    var unicodeMap = function() {
+
+      var bin = base64DecodeInputStream(unicodeData);
+      var read = function() {
+        var b = bin.read();
+        if (b == -1) throw 'eof';
+        return b;
+      };
+
+      var count = 0;
+      var unicodeMap = {};
+      while (true) {
+        var b0 = bin.read();
+        if (b0 == -1) break;
+        var b1 = read();
+        var b2 = read();
+        var b3 = read();
+        var k = String.fromCharCode( (b0 << 8) | b1);
+        var v = (b2 << 8) | b3;
+        unicodeMap[k] = v;
+        count += 1;
+      }
+      if (count != numChars) {
+        throw count + ' != ' + numChars;
+      }
+
+      return unicodeMap;
+    }();
+
+    var unknownChar = '?'.charCodeAt(0);
+
+    return function(s) {
+      var bytes = [];
+      for (var i = 0; i < s.length; i += 1) {
+        var c = s.charCodeAt(i);
+        if (c < 128) {
+          bytes.push(c);
+        } else {
+          var b = unicodeMap[s.charAt(i)];
+          if (typeof b == 'number') {
+            if ( (b & 0xff) == b) {
+              // 1byte
+              bytes.push(b);
+            } else {
+              // 2bytes
+              bytes.push(b >>> 8);
+              bytes.push(b & 0xff);
+            }
+          } else {
+            bytes.push(unknownChar);
+          }
+        }
+      }
+      return bytes;
+    };
+  };
+
+  //---------------------------------------------------------------------
+  // QRMode
+  //---------------------------------------------------------------------
+
+  var QRMode = {
+    MODE_NUMBER :    1 << 0,
+    MODE_ALPHA_NUM : 1 << 1,
+    MODE_8BIT_BYTE : 1 << 2,
+    MODE_KANJI :     1 << 3
+  };
+
+  //---------------------------------------------------------------------
+  // QRErrorCorrectionLevel
+  //---------------------------------------------------------------------
+
+  var QRErrorCorrectionLevel = {
+    L : 1,
+    M : 0,
+    Q : 3,
+    H : 2
+  };
+
+  //---------------------------------------------------------------------
+  // QRMaskPattern
+  //---------------------------------------------------------------------
+
+  var QRMaskPattern = {
+    PATTERN000 : 0,
+    PATTERN001 : 1,
+    PATTERN010 : 2,
+    PATTERN011 : 3,
+    PATTERN100 : 4,
+    PATTERN101 : 5,
+    PATTERN110 : 6,
+    PATTERN111 : 7
+  };
+
+  //---------------------------------------------------------------------
+  // QRUtil
+  //---------------------------------------------------------------------
+
+  var QRUtil = function() {
+
+    var PATTERN_POSITION_TABLE = [
+      [],
+      [6, 18],
+      [6, 22],
+      [6, 26],
+      [6, 30],
+      [6, 34],
+      [6, 22, 38],
+      [6, 24, 42],
+      [6, 26, 46],
+      [6, 28, 50],
+      [6, 30, 54],
+      [6, 32, 58],
+      [6, 34, 62],
+      [6, 26, 46, 66],
+      [6, 26, 48, 70],
+      [6, 26, 50, 74],
+      [6, 30, 54, 78],
+      [6, 30, 56, 82],
+      [6, 30, 58, 86],
+      [6, 34, 62, 90],
+      [6, 28, 50, 72, 94],
+      [6, 26, 50, 74, 98],
+      [6, 30, 54, 78, 102],
+      [6, 28, 54, 80, 106],
+      [6, 32, 58, 84, 110],
+      [6, 30, 58, 86, 114],
+      [6, 34, 62, 90, 118],
+      [6, 26, 50, 74, 98, 122],
+      [6, 30, 54, 78, 102, 126],
+      [6, 26, 52, 78, 104, 130],
+      [6, 30, 56, 82, 108, 134],
+      [6, 34, 60, 86, 112, 138],
+      [6, 30, 58, 86, 114, 142],
+      [6, 34, 62, 90, 118, 146],
+      [6, 30, 54, 78, 102, 126, 150],
+      [6, 24, 50, 76, 102, 128, 154],
+      [6, 28, 54, 80, 106, 132, 158],
+      [6, 32, 58, 84, 110, 136, 162],
+      [6, 26, 54, 82, 110, 138, 166],
+      [6, 30, 58, 86, 114, 142, 170]
+    ];
+    var G15 = (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0);
+    var G18 = (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0);
+    var G15_MASK = (1 << 14) | (1 << 12) | (1 << 10) | (1 << 4) | (1 << 1);
+
+    var _this = {};
+
+    var getBCHDigit = function(data) {
+      var digit = 0;
+      while (data != 0) {
+        digit += 1;
+        data >>>= 1;
+      }
+      return digit;
+    };
+
+    _this.getBCHTypeInfo = function(data) {
+      var d = data << 10;
+      while (getBCHDigit(d) - getBCHDigit(G15) >= 0) {
+        d ^= (G15 << (getBCHDigit(d) - getBCHDigit(G15) ) );
+      }
+      return ( (data << 10) | d) ^ G15_MASK;
+    };
+
+    _this.getBCHTypeNumber = function(data) {
+      var d = data << 12;
+      while (getBCHDigit(d) - getBCHDigit(G18) >= 0) {
+        d ^= (G18 << (getBCHDigit(d) - getBCHDigit(G18) ) );
+      }
+      return (data << 12) | d;
+    };
+
+    _this.getPatternPosition = function(typeNumber) {
+      return PATTERN_POSITION_TABLE[typeNumber - 1];
+    };
+
+    _this.getMaskFunction = function(maskPattern) {
+
+      switch (maskPattern) {
+
+      case QRMaskPattern.PATTERN000 :
+        return function(i, j) { return (i + j) % 2 == 0; };
+      case QRMaskPattern.PATTERN001 :
+        return function(i, j) { return i % 2 == 0; };
+      case QRMaskPattern.PATTERN010 :
+        return function(i, j) { return j % 3 == 0; };
+      case QRMaskPattern.PATTERN011 :
+        return function(i, j) { return (i + j) % 3 == 0; };
+      case QRMaskPattern.PATTERN100 :
+        return function(i, j) { return (Math.floor(i / 2) + Math.floor(j / 3) ) % 2 == 0; };
+      case QRMaskPattern.PATTERN101 :
+        return function(i, j) { return (i * j) % 2 + (i * j) % 3 == 0; };
+      case QRMaskPattern.PATTERN110 :
+        return function(i, j) { return ( (i * j) % 2 + (i * j) % 3) % 2 == 0; };
+      case QRMaskPattern.PATTERN111 :
+        return function(i, j) { return ( (i * j) % 3 + (i + j) % 2) % 2 == 0; };
+
+      default :
+        throw 'bad maskPattern:' + maskPattern;
+      }
+    };
+
+    _this.getErrorCorrectPolynomial = function(errorCorrectLength) {
+      var a = qrPolynomial([1], 0);
+      for (var i = 0; i < errorCorrectLength; i += 1) {
+        a = a.multiply(qrPolynomial([1, QRMath.gexp(i)], 0) );
+      }
+      return a;
+    };
+
+    _this.getLengthInBits = function(mode, type) {
+
+      if (1 <= type && type < 10) {
+
+        // 1 - 9
+
+        switch(mode) {
+        case QRMode.MODE_NUMBER    : return 10;
+        case QRMode.MODE_ALPHA_NUM : return 9;
+        case QRMode.MODE_8BIT_BYTE : return 8;
+        case QRMode.MODE_KANJI     : return 8;
+        default :
+          throw 'mode:' + mode;
+        }
+
+      } else if (type < 27) {
+
+        // 10 - 26
+
+        switch(mode) {
+        case QRMode.MODE_NUMBER    : return 12;
+        case QRMode.MODE_ALPHA_NUM : return 11;
+        case QRMode.MODE_8BIT_BYTE : return 16;
+        case QRMode.MODE_KANJI     : return 10;
+        default :
+          throw 'mode:' + mode;
+        }
+
+      } else if (type < 41) {
+
+        // 27 - 40
+
+        switch(mode) {
+        case QRMode.MODE_NUMBER    : return 14;
+        case QRMode.MODE_ALPHA_NUM : return 13;
+        case QRMode.MODE_8BIT_BYTE : return 16;
+        case QRMode.MODE_KANJI     : return 12;
+        default :
+          throw 'mode:' + mode;
+        }
+
+      } else {
+        throw 'type:' + type;
+      }
+    };
+
+    _this.getLostPoint = function(qrcode) {
+
+      var moduleCount = qrcode.getModuleCount();
+
+      var lostPoint = 0;
+
+      // LEVEL1
+
+      for (var row = 0; row < moduleCount; row += 1) {
+        for (var col = 0; col < moduleCount; col += 1) {
+
+          var sameCount = 0;
+          var dark = qrcode.isDark(row, col);
+
+          for (var r = -1; r <= 1; r += 1) {
+
+            if (row + r < 0 || moduleCount <= row + r) {
+              continue;
+            }
+
+            for (var c = -1; c <= 1; c += 1) {
+
+              if (col + c < 0 || moduleCount <= col + c) {
+                continue;
+              }
+
+              if (r == 0 && c == 0) {
+                continue;
+              }
+
+              if (dark == qrcode.isDark(row + r, col + c) ) {
+                sameCount += 1;
+              }
+            }
+          }
+
+          if (sameCount > 5) {
+            lostPoint += (3 + sameCount - 5);
+          }
+        }
+      };
+
+      // LEVEL2
+
+      for (var row = 0; row < moduleCount - 1; row += 1) {
+        for (var col = 0; col < moduleCount - 1; col += 1) {
+          var count = 0;
+          if (qrcode.isDark(row, col) ) count += 1;
+          if (qrcode.isDark(row + 1, col) ) count += 1;
+          if (qrcode.isDark(row, col + 1) ) count += 1;
+          if (qrcode.isDark(row + 1, col + 1) ) count += 1;
+          if (count == 0 || count == 4) {
+            lostPoint += 3;
+          }
+        }
+      }
+
+      // LEVEL3
+
+      for (var row = 0; row < moduleCount; row += 1) {
+        for (var col = 0; col < moduleCount - 6; col += 1) {
+          if (qrcode.isDark(row, col)
+              && !qrcode.isDark(row, col + 1)
+              &&  qrcode.isDark(row, col + 2)
+              &&  qrcode.isDark(row, col + 3)
+              &&  qrcode.isDark(row, col + 4)
+              && !qrcode.isDark(row, col + 5)
+              &&  qrcode.isDark(row, col + 6) ) {
+            lostPoint += 40;
+          }
+        }
+      }
+
+      for (var col = 0; col < moduleCount; col += 1) {
+        for (var row = 0; row < moduleCount - 6; row += 1) {
+          if (qrcode.isDark(row, col)
+              && !qrcode.isDark(row + 1, col)
+              &&  qrcode.isDark(row + 2, col)
+              &&  qrcode.isDark(row + 3, col)
+              &&  qrcode.isDark(row + 4, col)
+              && !qrcode.isDark(row + 5, col)
+              &&  qrcode.isDark(row + 6, col) ) {
+            lostPoint += 40;
+          }
+        }
+      }
+
+      // LEVEL4
+
+      var darkCount = 0;
+
+      for (var col = 0; col < moduleCount; col += 1) {
+        for (var row = 0; row < moduleCount; row += 1) {
+          if (qrcode.isDark(row, col) ) {
+            darkCount += 1;
+          }
+        }
+      }
+
+      var ratio = Math.abs(100 * darkCount / moduleCount / moduleCount - 50) / 5;
+      lostPoint += ratio * 10;
+
+      return lostPoint;
+    };
+
+    return _this;
+  }();
+
+  //---------------------------------------------------------------------
+  // QRMath
+  //---------------------------------------------------------------------
+
+  var QRMath = function() {
+
+    var EXP_TABLE = new Array(256);
+    var LOG_TABLE = new Array(256);
+
+    // initialize tables
+    for (var i = 0; i < 8; i += 1) {
+      EXP_TABLE[i] = 1 << i;
+    }
+    for (var i = 8; i < 256; i += 1) {
+      EXP_TABLE[i] = EXP_TABLE[i - 4]
+        ^ EXP_TABLE[i - 5]
+        ^ EXP_TABLE[i - 6]
+        ^ EXP_TABLE[i - 8];
+    }
+    for (var i = 0; i < 255; i += 1) {
+      LOG_TABLE[EXP_TABLE[i] ] = i;
+    }
+
+    var _this = {};
+
+    _this.glog = function(n) {
+
+      if (n < 1) {
+        throw 'glog(' + n + ')';
+      }
+
+      return LOG_TABLE[n];
+    };
+
+    _this.gexp = function(n) {
+
+      while (n < 0) {
+        n += 255;
+      }
+
+      while (n >= 256) {
+        n -= 255;
+      }
+
+      return EXP_TABLE[n];
+    };
+
+    return _this;
+  }();
+
+  //---------------------------------------------------------------------
+  // qrPolynomial
+  //---------------------------------------------------------------------
+
+  function qrPolynomial(num, shift) {
+
+    if (typeof num.length == 'undefined') {
+      throw num.length + '/' + shift;
+    }
+
+    var _num = function() {
+      var offset = 0;
+      while (offset < num.length && num[offset] == 0) {
+        offset += 1;
+      }
+      var _num = new Array(num.length - offset + shift);
+      for (var i = 0; i < num.length - offset; i += 1) {
+        _num[i] = num[i + offset];
+      }
+      return _num;
+    }();
+
+    var _this = {};
+
+    _this.getAt = function(index) {
+      return _num[index];
+    };
+
+    _this.getLength = function() {
+      return _num.length;
+    };
+
+    _this.multiply = function(e) {
+
+      var num = new Array(_this.getLength() + e.getLength() - 1);
+
+      for (var i = 0; i < _this.getLength(); i += 1) {
+        for (var j = 0; j < e.getLength(); j += 1) {
+          num[i + j] ^= QRMath.gexp(QRMath.glog(_this.getAt(i) ) + QRMath.glog(e.getAt(j) ) );
+        }
+      }
+
+      return qrPolynomial(num, 0);
+    };
+
+    _this.mod = function(e) {
+
+      if (_this.getLength() - e.getLength() < 0) {
+        return _this;
+      }
+
+      var ratio = QRMath.glog(_this.getAt(0) ) - QRMath.glog(e.getAt(0) );
+
+      var num = new Array(_this.getLength() );
+      for (var i = 0; i < _this.getLength(); i += 1) {
+        num[i] = _this.getAt(i);
+      }
+
+      for (var i = 0; i < e.getLength(); i += 1) {
+        num[i] ^= QRMath.gexp(QRMath.glog(e.getAt(i) ) + ratio);
+      }
+
+      // recursive call
+      return qrPolynomial(num, 0).mod(e);
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // QRRSBlock
+  //---------------------------------------------------------------------
+
+  var QRRSBlock = function() {
+
+    var RS_BLOCK_TABLE = [
+
+      // L
+      // M
+      // Q
+      // H
+
+      // 1
+      [1, 26, 19],
+      [1, 26, 16],
+      [1, 26, 13],
+      [1, 26, 9],
+
+      // 2
+      [1, 44, 34],
+      [1, 44, 28],
+      [1, 44, 22],
+      [1, 44, 16],
+
+      // 3
+      [1, 70, 55],
+      [1, 70, 44],
+      [2, 35, 17],
+      [2, 35, 13],
+
+      // 4
+      [1, 100, 80],
+      [2, 50, 32],
+      [2, 50, 24],
+      [4, 25, 9],
+
+      // 5
+      [1, 134, 108],
+      [2, 67, 43],
+      [2, 33, 15, 2, 34, 16],
+      [2, 33, 11, 2, 34, 12],
+
+      // 6
+      [2, 86, 68],
+      [4, 43, 27],
+      [4, 43, 19],
+      [4, 43, 15],
+
+      // 7
+      [2, 98, 78],
+      [4, 49, 31],
+      [2, 32, 14, 4, 33, 15],
+      [4, 39, 13, 1, 40, 14],
+
+      // 8
+      [2, 121, 97],
+      [2, 60, 38, 2, 61, 39],
+      [4, 40, 18, 2, 41, 19],
+      [4, 40, 14, 2, 41, 15],
+
+      // 9
+      [2, 146, 116],
+      [3, 58, 36, 2, 59, 37],
+      [4, 36, 16, 4, 37, 17],
+      [4, 36, 12, 4, 37, 13],
+
+      // 10
+      [2, 86, 68, 2, 87, 69],
+      [4, 69, 43, 1, 70, 44],
+      [6, 43, 19, 2, 44, 20],
+      [6, 43, 15, 2, 44, 16],
+
+      // 11
+      [4, 101, 81],
+      [1, 80, 50, 4, 81, 51],
+      [4, 50, 22, 4, 51, 23],
+      [3, 36, 12, 8, 37, 13],
+
+      // 12
+      [2, 116, 92, 2, 117, 93],
+      [6, 58, 36, 2, 59, 37],
+      [4, 46, 20, 6, 47, 21],
+      [7, 42, 14, 4, 43, 15],
+
+      // 13
+      [4, 133, 107],
+      [8, 59, 37, 1, 60, 38],
+      [8, 44, 20, 4, 45, 21],
+      [12, 33, 11, 4, 34, 12],
+
+      // 14
+      [3, 145, 115, 1, 146, 116],
+      [4, 64, 40, 5, 65, 41],
+      [11, 36, 16, 5, 37, 17],
+      [11, 36, 12, 5, 37, 13],
+
+      // 15
+      [5, 109, 87, 1, 110, 88],
+      [5, 65, 41, 5, 66, 42],
+      [5, 54, 24, 7, 55, 25],
+      [11, 36, 12, 7, 37, 13],
+
+      // 16
+      [5, 122, 98, 1, 123, 99],
+      [7, 73, 45, 3, 74, 46],
+      [15, 43, 19, 2, 44, 20],
+      [3, 45, 15, 13, 46, 16],
+
+      // 17
+      [1, 135, 107, 5, 136, 108],
+      [10, 74, 46, 1, 75, 47],
+      [1, 50, 22, 15, 51, 23],
+      [2, 42, 14, 17, 43, 15],
+
+      // 18
+      [5, 150, 120, 1, 151, 121],
+      [9, 69, 43, 4, 70, 44],
+      [17, 50, 22, 1, 51, 23],
+      [2, 42, 14, 19, 43, 15],
+
+      // 19
+      [3, 141, 113, 4, 142, 114],
+      [3, 70, 44, 11, 71, 45],
+      [17, 47, 21, 4, 48, 22],
+      [9, 39, 13, 16, 40, 14],
+
+      // 20
+      [3, 135, 107, 5, 136, 108],
+      [3, 67, 41, 13, 68, 42],
+      [15, 54, 24, 5, 55, 25],
+      [15, 43, 15, 10, 44, 16],
+
+      // 21
+      [4, 144, 116, 4, 145, 117],
+      [17, 68, 42],
+      [17, 50, 22, 6, 51, 23],
+      [19, 46, 16, 6, 47, 17],
+
+      // 22
+      [2, 139, 111, 7, 140, 112],
+      [17, 74, 46],
+      [7, 54, 24, 16, 55, 25],
+      [34, 37, 13],
+
+      // 23
+      [4, 151, 121, 5, 152, 122],
+      [4, 75, 47, 14, 76, 48],
+      [11, 54, 24, 14, 55, 25],
+      [16, 45, 15, 14, 46, 16],
+
+      // 24
+      [6, 147, 117, 4, 148, 118],
+      [6, 73, 45, 14, 74, 46],
+      [11, 54, 24, 16, 55, 25],
+      [30, 46, 16, 2, 47, 17],
+
+      // 25
+      [8, 132, 106, 4, 133, 107],
+      [8, 75, 47, 13, 76, 48],
+      [7, 54, 24, 22, 55, 25],
+      [22, 45, 15, 13, 46, 16],
+
+      // 26
+      [10, 142, 114, 2, 143, 115],
+      [19, 74, 46, 4, 75, 47],
+      [28, 50, 22, 6, 51, 23],
+      [33, 46, 16, 4, 47, 17],
+
+      // 27
+      [8, 152, 122, 4, 153, 123],
+      [22, 73, 45, 3, 74, 46],
+      [8, 53, 23, 26, 54, 24],
+      [12, 45, 15, 28, 46, 16],
+
+      // 28
+      [3, 147, 117, 10, 148, 118],
+      [3, 73, 45, 23, 74, 46],
+      [4, 54, 24, 31, 55, 25],
+      [11, 45, 15, 31, 46, 16],
+
+      // 29
+      [7, 146, 116, 7, 147, 117],
+      [21, 73, 45, 7, 74, 46],
+      [1, 53, 23, 37, 54, 24],
+      [19, 45, 15, 26, 46, 16],
+
+      // 30
+      [5, 145, 115, 10, 146, 116],
+      [19, 75, 47, 10, 76, 48],
+      [15, 54, 24, 25, 55, 25],
+      [23, 45, 15, 25, 46, 16],
+
+      // 31
+      [13, 145, 115, 3, 146, 116],
+      [2, 74, 46, 29, 75, 47],
+      [42, 54, 24, 1, 55, 25],
+      [23, 45, 15, 28, 46, 16],
+
+      // 32
+      [17, 145, 115],
+      [10, 74, 46, 23, 75, 47],
+      [10, 54, 24, 35, 55, 25],
+      [19, 45, 15, 35, 46, 16],
+
+      // 33
+      [17, 145, 115, 1, 146, 116],
+      [14, 74, 46, 21, 75, 47],
+      [29, 54, 24, 19, 55, 25],
+      [11, 45, 15, 46, 46, 16],
+
+      // 34
+      [13, 145, 115, 6, 146, 116],
+      [14, 74, 46, 23, 75, 47],
+      [44, 54, 24, 7, 55, 25],
+      [59, 46, 16, 1, 47, 17],
+
+      // 35
+      [12, 151, 121, 7, 152, 122],
+      [12, 75, 47, 26, 76, 48],
+      [39, 54, 24, 14, 55, 25],
+      [22, 45, 15, 41, 46, 16],
+
+      // 36
+      [6, 151, 121, 14, 152, 122],
+      [6, 75, 47, 34, 76, 48],
+      [46, 54, 24, 10, 55, 25],
+      [2, 45, 15, 64, 46, 16],
+
+      // 37
+      [17, 152, 122, 4, 153, 123],
+      [29, 74, 46, 14, 75, 47],
+      [49, 54, 24, 10, 55, 25],
+      [24, 45, 15, 46, 46, 16],
+
+      // 38
+      [4, 152, 122, 18, 153, 123],
+      [13, 74, 46, 32, 75, 47],
+      [48, 54, 24, 14, 55, 25],
+      [42, 45, 15, 32, 46, 16],
+
+      // 39
+      [20, 147, 117, 4, 148, 118],
+      [40, 75, 47, 7, 76, 48],
+      [43, 54, 24, 22, 55, 25],
+      [10, 45, 15, 67, 46, 16],
+
+      // 40
+      [19, 148, 118, 6, 149, 119],
+      [18, 75, 47, 31, 76, 48],
+      [34, 54, 24, 34, 55, 25],
+      [20, 45, 15, 61, 46, 16]
+    ];
+
+    var qrRSBlock = function(totalCount, dataCount) {
+      var _this = {};
+      _this.totalCount = totalCount;
+      _this.dataCount = dataCount;
+      return _this;
+    };
+
+    var _this = {};
+
+    var getRsBlockTable = function(typeNumber, errorCorrectionLevel) {
+
+      switch(errorCorrectionLevel) {
+      case QRErrorCorrectionLevel.L :
+        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 0];
+      case QRErrorCorrectionLevel.M :
+        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 1];
+      case QRErrorCorrectionLevel.Q :
+        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 2];
+      case QRErrorCorrectionLevel.H :
+        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 3];
+      default :
+        return undefined;
+      }
+    };
+
+    _this.getRSBlocks = function(typeNumber, errorCorrectionLevel) {
+
+      var rsBlock = getRsBlockTable(typeNumber, errorCorrectionLevel);
+
+      if (typeof rsBlock == 'undefined') {
+        throw 'bad rs block @ typeNumber:' + typeNumber +
+            '/errorCorrectionLevel:' + errorCorrectionLevel;
+      }
+
+      var length = rsBlock.length / 3;
+
+      var list = [];
+
+      for (var i = 0; i < length; i += 1) {
+
+        var count = rsBlock[i * 3 + 0];
+        var totalCount = rsBlock[i * 3 + 1];
+        var dataCount = rsBlock[i * 3 + 2];
+
+        for (var j = 0; j < count; j += 1) {
+          list.push(qrRSBlock(totalCount, dataCount) );
+        }
+      }
+
+      return list;
+    };
+
+    return _this;
+  }();
+
+  //---------------------------------------------------------------------
+  // qrBitBuffer
+  //---------------------------------------------------------------------
+
+  var qrBitBuffer = function() {
+
+    var _buffer = [];
+    var _length = 0;
+
+    var _this = {};
+
+    _this.getBuffer = function() {
+      return _buffer;
+    };
+
+    _this.getAt = function(index) {
+      var bufIndex = Math.floor(index / 8);
+      return ( (_buffer[bufIndex] >>> (7 - index % 8) ) & 1) == 1;
+    };
+
+    _this.put = function(num, length) {
+      for (var i = 0; i < length; i += 1) {
+        _this.putBit( ( (num >>> (length - i - 1) ) & 1) == 1);
+      }
+    };
+
+    _this.getLengthInBits = function() {
+      return _length;
+    };
+
+    _this.putBit = function(bit) {
+
+      var bufIndex = Math.floor(_length / 8);
+      if (_buffer.length <= bufIndex) {
+        _buffer.push(0);
+      }
+
+      if (bit) {
+        _buffer[bufIndex] |= (0x80 >>> (_length % 8) );
+      }
+
+      _length += 1;
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // qrNumber
+  //---------------------------------------------------------------------
+
+  var qrNumber = function(data) {
+
+    var _mode = QRMode.MODE_NUMBER;
+    var _data = data;
+
+    var _this = {};
+
+    _this.getMode = function() {
+      return _mode;
+    };
+
+    _this.getLength = function(buffer) {
+      return _data.length;
+    };
+
+    _this.write = function(buffer) {
+
+      var data = _data;
+
+      var i = 0;
+
+      while (i + 2 < data.length) {
+        buffer.put(strToNum(data.substring(i, i + 3) ), 10);
+        i += 3;
+      }
+
+      if (i < data.length) {
+        if (data.length - i == 1) {
+          buffer.put(strToNum(data.substring(i, i + 1) ), 4);
+        } else if (data.length - i == 2) {
+          buffer.put(strToNum(data.substring(i, i + 2) ), 7);
+        }
+      }
+    };
+
+    var strToNum = function(s) {
+      var num = 0;
+      for (var i = 0; i < s.length; i += 1) {
+        num = num * 10 + chatToNum(s.charAt(i) );
+      }
+      return num;
+    };
+
+    var chatToNum = function(c) {
+      if ('0' <= c && c <= '9') {
+        return c.charCodeAt(0) - '0'.charCodeAt(0);
+      }
+      throw 'illegal char :' + c;
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // qrAlphaNum
+  //---------------------------------------------------------------------
+
+  var qrAlphaNum = function(data) {
+
+    var _mode = QRMode.MODE_ALPHA_NUM;
+    var _data = data;
+
+    var _this = {};
+
+    _this.getMode = function() {
+      return _mode;
+    };
+
+    _this.getLength = function(buffer) {
+      return _data.length;
+    };
+
+    _this.write = function(buffer) {
+
+      var s = _data;
+
+      var i = 0;
+
+      while (i + 1 < s.length) {
+        buffer.put(
+          getCode(s.charAt(i) ) * 45 +
+          getCode(s.charAt(i + 1) ), 11);
+        i += 2;
+      }
+
+      if (i < s.length) {
+        buffer.put(getCode(s.charAt(i) ), 6);
+      }
+    };
+
+    var getCode = function(c) {
+
+      if ('0' <= c && c <= '9') {
+        return c.charCodeAt(0) - '0'.charCodeAt(0);
+      } else if ('A' <= c && c <= 'Z') {
+        return c.charCodeAt(0) - 'A'.charCodeAt(0) + 10;
+      } else {
+        switch (c) {
+        case ' ' : return 36;
+        case '$' : return 37;
+        case '%' : return 38;
+        case '*' : return 39;
+        case '+' : return 40;
+        case '-' : return 41;
+        case '.' : return 42;
+        case '/' : return 43;
+        case ':' : return 44;
+        default :
+          throw 'illegal char :' + c;
+        }
+      }
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // qr8BitByte
+  //---------------------------------------------------------------------
+
+  var qr8BitByte = function(data) {
+
+    var _mode = QRMode.MODE_8BIT_BYTE;
+    var _data = data;
+    var _bytes = qrcode.stringToBytes(data);
+
+    var _this = {};
+
+    _this.getMode = function() {
+      return _mode;
+    };
+
+    _this.getLength = function(buffer) {
+      return _bytes.length;
+    };
+
+    _this.write = function(buffer) {
+      for (var i = 0; i < _bytes.length; i += 1) {
+        buffer.put(_bytes[i], 8);
+      }
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // qrKanji
+  //---------------------------------------------------------------------
+
+  var qrKanji = function(data) {
+
+    var _mode = QRMode.MODE_KANJI;
+    var _data = data;
+
+    var stringToBytes = qrcode.stringToBytesFuncs['SJIS'];
+    if (!stringToBytes) {
+      throw 'sjis not supported.';
+    }
+    !function(c, code) {
+      // self test for sjis support.
+      var test = stringToBytes(c);
+      if (test.length != 2 || ( (test[0] << 8) | test[1]) != code) {
+        throw 'sjis not supported.';
+      }
+    }('\u53cb', 0x9746);
+
+    var _bytes = stringToBytes(data);
+
+    var _this = {};
+
+    _this.getMode = function() {
+      return _mode;
+    };
+
+    _this.getLength = function(buffer) {
+      return ~~(_bytes.length / 2);
+    };
+
+    _this.write = function(buffer) {
+
+      var data = _bytes;
+
+      var i = 0;
+
+      while (i + 1 < data.length) {
+
+        var c = ( (0xff & data[i]) << 8) | (0xff & data[i + 1]);
+
+        if (0x8140 <= c && c <= 0x9FFC) {
+          c -= 0x8140;
+        } else if (0xE040 <= c && c <= 0xEBBF) {
+          c -= 0xC140;
+        } else {
+          throw 'illegal char at ' + (i + 1) + '/' + c;
+        }
+
+        c = ( (c >>> 8) & 0xff) * 0xC0 + (c & 0xff);
+
+        buffer.put(c, 13);
+
+        i += 2;
+      }
+
+      if (i < data.length) {
+        throw 'illegal char at ' + (i + 1);
+      }
+    };
+
+    return _this;
+  };
+
+  //=====================================================================
+  // GIF Support etc.
+  //
+
+  //---------------------------------------------------------------------
+  // byteArrayOutputStream
+  //---------------------------------------------------------------------
+
+  var byteArrayOutputStream = function() {
+
+    var _bytes = [];
+
+    var _this = {};
+
+    _this.writeByte = function(b) {
+      _bytes.push(b & 0xff);
+    };
+
+    _this.writeShort = function(i) {
+      _this.writeByte(i);
+      _this.writeByte(i >>> 8);
+    };
+
+    _this.writeBytes = function(b, off, len) {
+      off = off || 0;
+      len = len || b.length;
+      for (var i = 0; i < len; i += 1) {
+        _this.writeByte(b[i + off]);
+      }
+    };
+
+    _this.writeString = function(s) {
+      for (var i = 0; i < s.length; i += 1) {
+        _this.writeByte(s.charCodeAt(i) );
+      }
+    };
+
+    _this.toByteArray = function() {
+      return _bytes;
+    };
+
+    _this.toString = function() {
+      var s = '';
+      s += '[';
+      for (var i = 0; i < _bytes.length; i += 1) {
+        if (i > 0) {
+          s += ',';
+        }
+        s += _bytes[i];
+      }
+      s += ']';
+      return s;
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // base64EncodeOutputStream
+  //---------------------------------------------------------------------
+
+  var base64EncodeOutputStream = function() {
+
+    var _buffer = 0;
+    var _buflen = 0;
+    var _length = 0;
+    var _base64 = '';
+
+    var _this = {};
+
+    var writeEncoded = function(b) {
+      _base64 += String.fromCharCode(encode(b & 0x3f) );
+    };
+
+    var encode = function(n) {
+      if (n < 0) {
+        // error.
+      } else if (n < 26) {
+        return 0x41 + n;
+      } else if (n < 52) {
+        return 0x61 + (n - 26);
+      } else if (n < 62) {
+        return 0x30 + (n - 52);
+      } else if (n == 62) {
+        return 0x2b;
+      } else if (n == 63) {
+        return 0x2f;
+      }
+      throw 'n:' + n;
+    };
+
+    _this.writeByte = function(n) {
+
+      _buffer = (_buffer << 8) | (n & 0xff);
+      _buflen += 8;
+      _length += 1;
+
+      while (_buflen >= 6) {
+        writeEncoded(_buffer >>> (_buflen - 6) );
+        _buflen -= 6;
+      }
+    };
+
+    _this.flush = function() {
+
+      if (_buflen > 0) {
+        writeEncoded(_buffer << (6 - _buflen) );
+        _buffer = 0;
+        _buflen = 0;
+      }
+
+      if (_length % 3 != 0) {
+        // padding
+        var padlen = 3 - _length % 3;
+        for (var i = 0; i < padlen; i += 1) {
+          _base64 += '=';
+        }
+      }
+    };
+
+    _this.toString = function() {
+      return _base64;
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // base64DecodeInputStream
+  //---------------------------------------------------------------------
+
+  var base64DecodeInputStream = function(str) {
+
+    var _str = str;
+    var _pos = 0;
+    var _buffer = 0;
+    var _buflen = 0;
+
+    var _this = {};
+
+    _this.read = function() {
+
+      while (_buflen < 8) {
+
+        if (_pos >= _str.length) {
+          if (_buflen == 0) {
+            return -1;
+          }
+          throw 'unexpected end of file./' + _buflen;
+        }
+
+        var c = _str.charAt(_pos);
+        _pos += 1;
+
+        if (c == '=') {
+          _buflen = 0;
+          return -1;
+        } else if (c.match(/^\s$/) ) {
+          // ignore if whitespace.
+          continue;
+        }
+
+        _buffer = (_buffer << 6) | decode(c.charCodeAt(0) );
+        _buflen += 6;
+      }
+
+      var n = (_buffer >>> (_buflen - 8) ) & 0xff;
+      _buflen -= 8;
+      return n;
+    };
+
+    var decode = function(c) {
+      if (0x41 <= c && c <= 0x5a) {
+        return c - 0x41;
+      } else if (0x61 <= c && c <= 0x7a) {
+        return c - 0x61 + 26;
+      } else if (0x30 <= c && c <= 0x39) {
+        return c - 0x30 + 52;
+      } else if (c == 0x2b) {
+        return 62;
+      } else if (c == 0x2f) {
+        return 63;
+      } else {
+        throw 'c:' + c;
+      }
+    };
+
+    return _this;
+  };
+
+  //---------------------------------------------------------------------
+  // gifImage (B/W)
+  //---------------------------------------------------------------------
+
+  var gifImage = function(width, height) {
+
+    var _width = width;
+    var _height = height;
+    var _data = new Array(width * height);
+
+    var _this = {};
+
+    _this.setPixel = function(x, y, pixel) {
+      _data[y * _width + x] = pixel;
+    };
+
+    _this.write = function(out) {
+
+      //---------------------------------
+      // GIF Signature
+
+      out.writeString('GIF87a');
+
+      //---------------------------------
+      // Screen Descriptor
+
+      out.writeShort(_width);
+      out.writeShort(_height);
+
+      out.writeByte(0x80); // 2bit
+      out.writeByte(0);
+      out.writeByte(0);
+
+      //---------------------------------
+      // Global Color Map
+
+      // black
+      out.writeByte(0x00);
+      out.writeByte(0x00);
+      out.writeByte(0x00);
+
+      // white
+      out.writeByte(0xff);
+      out.writeByte(0xff);
+      out.writeByte(0xff);
+
+      //---------------------------------
+      // Image Descriptor
+
+      out.writeString(',');
+      out.writeShort(0);
+      out.writeShort(0);
+      out.writeShort(_width);
+      out.writeShort(_height);
+      out.writeByte(0);
+
+      //---------------------------------
+      // Local Color Map
+
+      //---------------------------------
+      // Raster Data
+
+      var lzwMinCodeSize = 2;
+      var raster = getLZWRaster(lzwMinCodeSize);
+
+      out.writeByte(lzwMinCodeSize);
+
+      var offset = 0;
+
+      while (raster.length - offset > 255) {
+        out.writeByte(255);
+        out.writeBytes(raster, offset, 255);
+        offset += 255;
+      }
+
+      out.writeByte(raster.length - offset);
+      out.writeBytes(raster, offset, raster.length - offset);
+      out.writeByte(0x00);
+
+      //---------------------------------
+      // GIF Terminator
+      out.writeString(';');
+    };
+
+    var bitOutputStream = function(out) {
+
+      var _out = out;
+      var _bitLength = 0;
+      var _bitBuffer = 0;
+
+      var _this = {};
+
+      _this.write = function(data, length) {
+
+        if ( (data >>> length) != 0) {
+          throw 'length over';
+        }
+
+        while (_bitLength + length >= 8) {
+          _out.writeByte(0xff & ( (data << _bitLength) | _bitBuffer) );
+          length -= (8 - _bitLength);
+          data >>>= (8 - _bitLength);
+          _bitBuffer = 0;
+          _bitLength = 0;
+        }
+
+        _bitBuffer = (data << _bitLength) | _bitBuffer;
+        _bitLength = _bitLength + length;
+      };
+
+      _this.flush = function() {
+        if (_bitLength > 0) {
+          _out.writeByte(_bitBuffer);
+        }
+      };
+
+      return _this;
+    };
+
+    var getLZWRaster = function(lzwMinCodeSize) {
+
+      var clearCode = 1 << lzwMinCodeSize;
+      var endCode = (1 << lzwMinCodeSize) + 1;
+      var bitLength = lzwMinCodeSize + 1;
+
+      // Setup LZWTable
+      var table = lzwTable();
+
+      for (var i = 0; i < clearCode; i += 1) {
+        table.add(String.fromCharCode(i) );
+      }
+      table.add(String.fromCharCode(clearCode) );
+      table.add(String.fromCharCode(endCode) );
+
+      var byteOut = byteArrayOutputStream();
+      var bitOut = bitOutputStream(byteOut);
+
+      // clear code
+      bitOut.write(clearCode, bitLength);
+
+      var dataIndex = 0;
+
+      var s = String.fromCharCode(_data[dataIndex]);
+      dataIndex += 1;
+
+      while (dataIndex < _data.length) {
+
+        var c = String.fromCharCode(_data[dataIndex]);
+        dataIndex += 1;
+
+        if (table.contains(s + c) ) {
+
+          s = s + c;
+
+        } else {
+
+          bitOut.write(table.indexOf(s), bitLength);
+
+          if (table.size() < 0xfff) {
+
+            if (table.size() == (1 << bitLength) ) {
+              bitLength += 1;
+            }
+
+            table.add(s + c);
+          }
+
+          s = c;
+        }
+      }
+
+      bitOut.write(table.indexOf(s), bitLength);
+
+      // end code
+      bitOut.write(endCode, bitLength);
+
+      bitOut.flush();
+
+      return byteOut.toByteArray();
+    };
+
+    var lzwTable = function() {
+
+      var _map = {};
+      var _size = 0;
+
+      var _this = {};
+
+      _this.add = function(key) {
+        if (_this.contains(key) ) {
+          throw 'dup key:' + key;
+        }
+        _map[key] = _size;
+        _size += 1;
+      };
+
+      _this.size = function() {
+        return _size;
+      };
+
+      _this.indexOf = function(key) {
+        return _map[key];
+      };
+
+      _this.contains = function(key) {
+        return typeof _map[key] != 'undefined';
+      };
+
+      return _this;
+    };
+
+    return _this;
+  };
+
+  var createDataURL = function(width, height, getPixel) {
+    var gif = gifImage(width, height);
+    for (var y = 0; y < height; y += 1) {
+      for (var x = 0; x < width; x += 1) {
+        gif.setPixel(x, y, getPixel(x, y) );
+      }
+    }
+
+    var b = byteArrayOutputStream();
+    gif.write(b);
+
+    var base64 = base64EncodeOutputStream();
+    var bytes = b.toByteArray();
+    for (var i = 0; i < bytes.length; i += 1) {
+      base64.writeByte(bytes[i]);
+    }
+    base64.flush();
+
+    return 'data:image/gif;base64,' + base64;
+  };
+
+  //---------------------------------------------------------------------
+  // returns qrcode function.
+
+  return qrcode;
+}();
+
+// multibyte support
+!function() {
+
+  qrcode.stringToBytesFuncs['UTF-8'] = function(s) {
+    // http://stackoverflow.com/questions/18729405/how-to-convert-utf8-string-to-byte-array
+    function toUTF8Array(str) {
+      var utf8 = [];
+      for (var i=0; i < str.length; i++) {
+        var charcode = str.charCodeAt(i);
+        if (charcode < 0x80) utf8.push(charcode);
+        else if (charcode < 0x800) {
+          utf8.push(0xc0 | (charcode >> 6),
+              0x80 | (charcode & 0x3f));
+        }
+        else if (charcode < 0xd800 || charcode >= 0xe000) {
+          utf8.push(0xe0 | (charcode >> 12),
+              0x80 | ((charcode>>6) & 0x3f),
+              0x80 | (charcode & 0x3f));
+        }
+        // surrogate pair
+        else {
+          i++;
+          // UTF-16 encodes 0x10000-0x10FFFF by
+          // subtracting 0x10000 and splitting the
+          // 20 bits of 0x0-0xFFFFF into two halves
+          charcode = 0x10000 + (((charcode & 0x3ff)<<10)
+            | (str.charCodeAt(i) & 0x3ff));
+          utf8.push(0xf0 | (charcode >>18),
+              0x80 | ((charcode>>12) & 0x3f),
+              0x80 | ((charcode>>6) & 0x3f),
+              0x80 | (charcode & 0x3f));
+        }
+      }
+      return utf8;
+    }
+    return toUTF8Array(s);
+  };
+
+}();
+
+module.exports = qrcode;
+  };
+  factories["./source-filter.cjs"] = function (require, module, exports) {
+const { BlockList, isIP } = require("node:net");
+
+function sourceFilter(value) {
+  if (typeof value !== "string" || value.length > 8192) throw new Error("Invalid IP allowlist");
+  const text = value.trim();
+  if (!text) return () => true;
+  const entries = text.split(/[\s,，;；]+/u).filter(Boolean);
+  if (!entries.length || entries.length > 256) throw new Error("Invalid IP allowlist");
+  const list = new BlockList();
+  for (const entry of entries) {
+    const [address, prefix, ...extra] = entry.split("/");
+    const ip = isIP(address);
+    const family = ip === 4 ? "ipv4" : "ipv6";
+    if (!ip || address.includes("%") || extra.length) throw new Error("Invalid IP allowlist entry");
+    if (prefix === undefined) {
+      list.addAddress(address, family);
+    } else {
+      const bits = Number(prefix);
+      if (!/^\d{1,3}$/u.test(prefix) || bits > (ip === 4 ? 32 : 128)) throw new Error("Invalid IP prefix");
+      list.addSubnet(address, bits, family);
+    }
+  }
+  return (address) => {
+    const ip = isIP(address);
+    return ip !== 0 && list.check(address, ip === 4 ? "ipv4" : "ipv6");
+  };
+}
+
+module.exports = { sourceFilter };
+  };
   const cache = new Map();
 
   function load(id) {
@@ -798,8 +3982,11 @@ const { insert } = require("solid-js/web");
 const { openGateway } = require("./gateway.cjs");
 const { Remote, attachMain } = require("./main.cjs");
 const { openControl } = require("./control.cjs");
+const { i18n } = require("./i18n.cjs");
+const { pairingPreview } = require("./pairing.cjs");
 
 exports.default = Plugin.define({
+  i18n,
   main(ctx) {
     return attachMain(ctx, { openGateway, openControl });
   },
@@ -807,36 +3994,75 @@ exports.default = Plugin.define({
   setup(ctx) {
     const remote = ctx.main(Remote);
     const ui = ctx.ui;
+    const t = (key, values) => ctx.t(key, values);
     ctx.add(SettingsPage, {
       id: "opencode-remote-access",
-      title: "远程访问",
-      icon: "server",
-      entries: [
-        { id: "listen-address", title: "监听地址" },
-        { id: "login", title: "登录凭据" },
-        { id: "listener", title: "监听状态" },
-      ],
+      get title() { return t("title"); },
+      icon: "outline-globe",
+      get entries() {
+        return [
+          { id: "listen-address", title: t("listenAddress") },
+          { id: "login", title: t("credentials") },
+          { id: "listener", title: t("listenerStatus") },
+          { id: "allowed-sources", title: t("allowedSources") },
+          { id: "login-log-file", title: t("signInLogs") },
+        ];
+      },
       render() {
         const [host, setHost] = createSignal("");
         const [port, setPort] = createSignal("");
         const [localPort, setLocalPort] = createSignal(0);
         const portConflict = () => localPort() > 0 && Number(port()) === localPort();
         const [username, setUsername] = createSignal("");
+        const [allowedSources, setAllowedSources] = createSignal("");
         const [password, setPassword] = createSignal("");
         const [visible, setVisible] = createSignal(false);
         const [ready, setReady] = createSignal(false);
         const [busy, setBusy] = createSignal(false);
         const [error, setError] = createSignal("");
-        const [pairing, setPairing] = createSignal("");
-        const [listener, setListener] = createSignal({ url: "", peers: [] });
+        const [pairing, setPairing] = createSignal();
+        const [listener, setListener] = createSignal({ url: "", peers: [], restarting: false, restartPending: false });
+        const [restartRequested, setRestartRequested] = createSignal(false);
+        const [savedNotice, setSavedNotice] = createSignal("");
+        const [logInfo, setLogInfo] = createSignal({ enabled: false, path: "", size: 0 });
+        const [logPath, setLogPath] = createSignal("");
+        const [logs, setLogs] = createSignal([]);
+        const [aliases, setAliases] = createSignal([]);
+        const [showLogs, setShowLogs] = createSignal(false);
+        const [visibleLogs, setVisibleLogs] = createSignal(25);
         const active = () => Boolean(listener().url);
+        const restarting = () => restartRequested() || listener().restarting;
         let subscribedUpdate = false;
 
+        function updateListener(snapshot) {
+          if (snapshot.url !== listener().url || snapshot.restarting) setPairing(undefined);
+          setListener(snapshot);
+        }
+        function updateLogInfo(snapshot) {
+          if (!logPath() || logPath() === logInfo().path) setLogPath(snapshot.path);
+          setLogInfo(snapshot);
+        }
+        function subscribe(event, get, apply) {
+          let updated = false;
+          let mounted = true;
+          const unsubscribe = remote.on(event, (value) => {
+            updated = true;
+            apply(value);
+          });
+          onCleanup(() => { mounted = false; unsubscribe(); });
+          void get().then((value) => {
+            if (mounted && !updated) apply(value);
+          }).catch((failure) => {
+            if (mounted) setError(failure.message);
+          });
+        }
         onCleanup(remote.on("listenerChanged", (snapshot) => {
           subscribedUpdate = true;
-          if (snapshot.url !== listener().url) setPairing("");
-          setListener(snapshot);
+          updateListener(snapshot);
         }));
+        subscribe("loginLogInfoChanged", () => remote.loginLogInfo(), updateLogInfo);
+        subscribe("loginLogsChanged", () => remote.loginLogs(), setLogs);
+        subscribe("deviceAliasesChanged", () => remote.deviceAliases(), setAliases);
         void remote.listener().then((snapshot) => {
           if (!subscribedUpdate) setListener(snapshot);
         }).catch((failure) => setError(failure.message));
@@ -847,6 +4073,7 @@ exports.default = Plugin.define({
           setPort(state.config.listenPort ? String(state.config.listenPort) : "");
           setLocalPort(state.localPort);
           setUsername(state.config.username);
+          setAllowedSources(state.config.allowedSources);
           setPassword(state.config.password);
           setError(state.configError);
         }
@@ -875,7 +4102,7 @@ exports.default = Plugin.define({
         function button(label, run, disabled = () => false, variant = () => "neutral") {
           return createComponent(ui.Button, {
             size: "small",
-            get children() { return typeof label === "function" ? label() : label; },
+            get children() { return typeof label === "function" ? label() : t(label); },
             get disabled() { return !ready() || busy() || disabled(); },
             get variant() { return variant(); },
             onClick: () => void act(run),
@@ -884,15 +4111,15 @@ exports.default = Plugin.define({
 
         function field(label, value, onInput, options = {}) {
           const input = createComponent(ui.TextInput, {
-            label,
+            get label() { return t(label); },
             get value() { return value(); },
             get type() { return options.type?.() || "text"; },
             get disabled() { return !ready() || busy(); },
-            placeholder: options.placeholder,
+            get placeholder() { return options.placeholder ? t(options.placeholder) : undefined; },
             onInput,
           });
           return element("div", "min-width:0;display:grid;gap:4px", [
-            element("span", "color:var(--v2-text-text-muted);font-size:12px", label),
+            element("span", "color:var(--v2-text-text-muted);font-size:12px", () => t(label)),
             options.control
               ? element("div", "min-width:0;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:3px", [input, options.control])
               : input,
@@ -911,8 +4138,8 @@ exports.default = Plugin.define({
         const endpointControls = element("div",
           "display:grid;width:clamp(228px,42vw,370px);max-width:100%;grid-template-columns:minmax(0,3fr) minmax(66px,1fr);gap:8px;align-items:end",
           [
-            field("IP 地址", host, setHost, { placeholder: "本机 IP" }),
-            field("端口", port, setPort),
+            field("ipAddress", host, setHost, { placeholder: "localIp" }),
+            field("port", port, setPort),
           ],
         );
 
@@ -920,7 +4147,7 @@ exports.default = Plugin.define({
           size: "small",
           variant: "ghost",
           get icon() { return visible() ? "outline-eye-slash" : "outline-eye"; },
-          get label() { return visible() ? "隐藏密码" : "显示密码"; },
+          get label() { return t(visible() ? "hidePassword" : "revealPassword"); },
           get pressed() { return visible(); },
           get disabled() { return !password(); },
           onClick: () => setVisible(!visible()),
@@ -928,120 +4155,282 @@ exports.default = Plugin.define({
         const loginControls = element("div",
           "display:grid;width:clamp(228px,42vw,370px);max-width:100%;grid-template-columns:minmax(80px,1fr) minmax(0,1.6fr);gap:8px;align-items:end",
           [
-            field("账号", username, setUsername),
-            field("密码", password, setPassword, { type: () => visible() ? "text" : "password", control: eye }),
+            field("username", username, setUsername),
+            field("password", password, setPassword, { type: () => visible() ? "text" : "password", control: eye }),
           ],
         );
-        const saveButton = button("保存设置", async () => {
+        function configuration() {
           const listenPort = Number(port());
           if (!/^\d+$/.test(port().trim()) || listenPort < 1 || listenPort > 65535) {
-            throw new Error("端口必须是 1 至 65535 的整数。");
+            throw new Error(t("error.invalidPort"));
           }
-          await remote.save({ listenHost: host().trim(), listenPort, username: username().trim(), password: password() });
-          setVisible(false);
-          setPairing("");
-          setListener(await remote.listener());
-        }, portConflict);
+          return {
+            listenHost: host().trim(), listenPort, username: username().trim(),
+            password: password(), allowedSources: allowedSources(),
+          };
+        }
+        async function saveSettings(restart) {
+          const config = configuration();
+          setSavedNotice("");
+          if (restart) setRestartRequested(true);
+          try {
+            if (restart) {
+              await remote.saveAndRestart(config);
+              setPairing(undefined);
+            } else {
+              await remote.save(config);
+            }
+            setVisible(false);
+            updateListener(await remote.listener());
+            setSavedNotice(restart ? "restartSuccess" : "saveSuccess");
+          } finally {
+            if (restart) setRestartRequested(false);
+          }
+        }
+        const saveActions = element("div", "padding:12px 20px;display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:6px", [
+          element("span", "margin-inline-end:auto;color:var(--v2-text-text-muted)", () => savedNotice() ? t(savedNotice()) : ""),
+          button("save", () => saveSettings(false), portConflict),
+          button("saveRestart", () => saveSettings(true), () => !active() || portConflict(), () => "contrast"),
+        ]);
 
         const statusDot = element("span", "width:6px;height:6px;display:inline-block;border-radius:50%;flex:none", "");
         insert(statusDot, () => {
-          statusDot.style.backgroundColor = active() ? "var(--v2-state-fg-success, #28a219)" : "var(--v2-text-text-faint, #8b8b8b)";
+          statusDot.style.backgroundColor = restarting()
+            ? "var(--v2-state-fg-warning, #c18118)"
+            : active() ? "var(--v2-state-fg-success, #28a219)" : "var(--v2-text-text-faint, #8b8b8b)";
           return "";
         });
         const statusLabel = element("span", "display:inline-flex;align-items:center;gap:8px", [
           statusDot,
-          () => active() ? "正在监听" : "未监听",
+          () => t(restarting() ? "restarting" : active() ? "listening" : "stopped"),
         ]);
         statusLabel.setAttribute("role", "status");
         const actions = element("div", "display:flex;flex-wrap:wrap;align-items:center;gap:6px", [
-          button(() => active() ? "停止监听" : "启动监听", async () => {
+          button(() => t(active() ? "stop" : "start"), async () => {
             if (active()) {
               await remote.stop();
-              setPairing("");
+              setPairing(undefined);
             } else {
               await remote.start();
             }
-            setListener(await remote.listener());
-          }, () => false, () => active() ? "neutral" : "contrast"),
-          button("在浏览器中打开", () => remote.openBrowser(), () => !active()),
-          button("生成配对二维码", async () => setPairing(await remote.pair()), () => !active()),
+            updateListener(await remote.listener());
+          }, restarting, () => active() ? "neutral" : "contrast"),
+          button("openBrowser", () => remote.openBrowser(), () => !active() || restarting()),
+          button("generateQr", async () => setPairing(await remote.pair()), () => !active() || restarting()),
         ]);
         const errorMessage = element("p", "color:var(--v2-state-fg-error, #bc322a);white-space:pre-wrap", error);
         errorMessage.setAttribute("role", "alert");
 
+        function closeDialogButton(key, onClick, variant = "neutral") {
+          return createComponent(ui.Button, {
+            size: "small", variant,
+            get children() { return t(key); },
+            onClick,
+          });
+        }
+
+        function editAlias(item) {
+          ctx.dialogs.open((dialog) => {
+            const [alias, setAlias] = createSignal(item.alias ?? "");
+            const [dialogError, setDialogError] = createSignal("");
+            const [saving, setSaving] = createSignal(false);
+            async function apply(value) {
+              if (saving()) return;
+              setSaving(true);
+              try {
+                await remote.setDeviceAlias({ deviceId: item.deviceId, alias: value });
+                dialog.close();
+              } catch (failure) {
+                setDialogError(failure.message);
+              } finally {
+                setSaving(false);
+              }
+            }
+            const content = element("div", "display:grid;gap:8px;padding-block:4px", [
+              createComponent(ui.TextInput, {
+                get label() { return t("aliasLabel"); },
+                get value() { return alias(); },
+                get disabled() { return saving(); },
+                onInput: setAlias,
+                onSubmit: () => void apply(alias()),
+              }),
+              element("p", "color:var(--v2-state-fg-error)", dialogError),
+            ]);
+            const footer = element("div", "display:flex;justify-content:flex-end;gap:6px", [
+              ...(item.alias ? [closeDialogButton("removeAlias", () => void apply(""), "danger")] : []),
+              closeDialogButton("cancel", dialog.close),
+              closeDialogButton("save", () => void apply(alias()), "contrast"),
+            ]);
+            return createComponent(ui.Dialog, {
+              get title() { return t("deviceAliases"); },
+              children: content,
+              footer,
+            });
+          });
+        }
+
+        function confirmClear() {
+          ctx.dialogs.open((dialog) => createComponent(ui.Dialog, {
+            get title() { return t("clearLogsConfirm"); },
+            get description() { return t("clearLogsDescription"); },
+            footer: element("div", "display:flex;justify-content:flex-end;gap:6px", [
+              closeDialogButton("cancel", dialog.close),
+              closeDialogButton("clear", () => {
+                dialog.close();
+                void act(async () => {
+                  await remote.clearLoginLogs();
+                  setLogs(await remote.loginLogs());
+                  updateLogInfo(await remote.loginLogInfo());
+                });
+              }, "danger"),
+            ]),
+          }));
+        }
+
+        function peerTitle(item) {
+          return item.isLocal ? t("thisComputer") : item.alias || item.deviceLabel || item.ip || t("unknownDevice");
+        }
+
+        function peerDetails(item) {
+          return [item.ip, item.isLocal ? item.alias : "", item.deviceLabel && item.deviceLabel !== peerTitle(item) ? item.deviceLabel : ""]
+            .filter((value) => value && value !== peerTitle(item)).join(" · ");
+        }
+
+        function aliasAction(item) {
+          return item.deviceId
+            ? button(item.alias ? "editAlias" : "setAlias", () => editAlias(item))
+            : undefined;
+        }
+
         const setupSection = createComponent(ui.SettingsSection, {
-          title: "配置",
+          get title() { return t("configuration"); },
           children: [
-            row("listen-address", "监听地址", () => {
-              if (!localPort()) return "填写本机网络接口的 IP 地址和端口。";
-              if (portConflict()) return `端口 ${localPort()} 已由桌面服务使用，请换一个端口。`;
-              return `桌面服务端口 ${localPort()}，请为远程入口选择其他端口。`;
+            row("listen-address", () => t("listenAddress"), () => {
+              const local = localPort();
+              if (!local) return t("listenAddressHelp");
+              return t(portConflict() ? "listenAddressConflict" : "listenAddressHint", { port: local });
             }, endpointControls),
-            row("login", "登录凭据", "监听中保存设置会重新打开远程入口，远程设备需重新登录。", loginControls),
+            row("login", () => t("credentials"), () => t("credentialsHelp"), loginControls),
+            row("allowed-sources", () => t("allowedSources"), () => t("allowedSourcesHelp"),
+              element("div", "width:clamp(228px,42vw,370px);max-width:100%", createComponent(ui.TextInput, {
+                get label() { return t("allowedSources"); },
+                get value() { return allowedSources(); },
+                get disabled() { return !ready() || busy(); },
+                placeholder: "192.0.2.8, 198.51.100.0/24",
+                onInput: setAllowedSources,
+              }))),
+            saveActions,
           ],
         });
         const listenerSection = createComponent(ui.SettingsSection, {
-          title: "监听",
-          get footer() { return error() ? errorMessage : undefined; },
+          get title() { return t("listener"); },
           children: [
-            row("listener", statusLabel, () => listener().url || "启动后可从能访问此地址的设备连接。", actions),
-            () => pairing() ? pairingPreview(pairing()) : null,
+            row("listener", statusLabel, () => {
+              if (listener().restartPending) return [listener().url, t("pending")].filter(Boolean).join(" · ");
+              return listener().url || (!restarting() ? t("listenerHelp") : "");
+            }, actions),
+            () => pairing() ? pairingPreview(pairing(), t, ui) : null,
           ],
         });
-        const connectionSection = createComponent(ui.SettingsSection, {
-          title: "当前连接",
+        const connectionsSection = createComponent(ui.SettingsSection, {
+          get title() { return t("connections"); },
           get children() {
             const peers = listener().peers;
             return peers.length
-              ? peers.map(({ ip, count }) => row(undefined, ip, undefined, `${count} 个连接`))
-              : row(undefined, "暂无连接", "连接建立后会按来源 IP 显示在这里。");
+              ? peers.map((peer) => row(undefined, () => peerTitle(peer), () => peerDetails(peer),
+                element("div", "display:flex;align-items:center;flex-wrap:wrap;gap:8px", [
+                  () => t(peer.count === 1 ? "connectionCountOne" : "connectionCount", { count: peer.count }),
+                  aliasAction(peer),
+                ])))
+              : row(undefined, () => t("noConnections"), () => t("noConnectionsHelp"));
+          },
+        });
+        const aliasesSection = createComponent(ui.SettingsSection, {
+          get title() { return t("deviceAliases"); },
+          get children() {
+            return aliases().length
+              ? aliases().map((item) => row(undefined, item.alias, item.deviceId, aliasAction(item)))
+              : row(undefined, () => t("noAliases"), () => t("noAliasesHelp"));
           },
         });
 
+        const logSwitch = createComponent(ui.Switch, {
+          get label() { return t("logRecording"); },
+          hideLabel: true,
+          get checked() { return logInfo().enabled; },
+          get disabled() { return !logInfo().path || busy(); },
+          onChange: (enabled) => void act(async () => {
+            await remote.configureLoginLog({ enabled, path: logInfo().path });
+            updateLogInfo(await remote.loginLogInfo());
+          }),
+        });
+        const pathControls = element("div", "width:clamp(228px,42vw,380px);max-width:100%;display:grid;gap:6px", [
+          createComponent(ui.TextInput, {
+            get label() { return t("logPath"); },
+            get value() { return logPath(); },
+            get disabled() { return !logInfo().path || busy(); },
+            onInput: setLogPath,
+          }),
+          element("div", "display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+            button("applyLogPath", async () => {
+              await remote.configureLoginLog({ enabled: logInfo().enabled, path: logPath() });
+              const info = await remote.loginLogInfo();
+              setLogPath(info.path);
+              setLogInfo(info);
+            }, () => !logPath() || logPath() === logInfo().path),
+            button("openLogFile", () => remote.openLoginLog(), () => !logInfo().path),
+          ]),
+        ]);
+        const logActions = element("div", "padding:12px 20px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+          button(() => t(showLogs() ? "hideLogs" : "viewLogs"), async () => {
+            if (!showLogs()) {
+              setLogs(await remote.loginLogs());
+              setVisibleLogs(25);
+            }
+            setShowLogs(!showLogs());
+          }),
+          button("clearLogs", confirmClear, () => !logInfo().size),
+        ]);
+        const logSection = createComponent(ui.SettingsSection, {
+          get title() { return t("signInLogs"); },
+          children: [
+            row("login-log-recording", () => t("logRecording"), () => t("logRecordingHelp"), logSwitch),
+            row("login-log-file", () => t("logPath"), element("div", "display:grid;gap:4px;overflow-wrap:anywhere", [
+              element("span", "user-select:text", () => logInfo().path),
+              () => t("fileSize", { size: `${logInfo().size.toLocaleString(t("dateLocale"))} B` }),
+            ]), pathControls),
+            logActions,
+            () => {
+              if (!showLogs()) return null;
+              const entries = logs();
+              if (!entries.length) return row(undefined, () => t("noLogs"));
+              return [
+                ...entries.slice(0, visibleLogs()).map((item) => row(
+                  undefined,
+                  () => `${peerTitle(item)} · ${t(item.method === "blocked" ? "blocked" : item.success ? "success" : "rejected")}`,
+                  () => [
+                    new Date(item.timestamp).toLocaleString(t("dateLocale")),
+                    t(item.method === "blocked" ? "methodBlocked" : item.method === "pair" ? "methodPair" : "methodBasic"),
+                    peerDetails(item),
+                  ].filter(Boolean).join(" · "),
+                  aliasAction(item),
+                )),
+                entries.length > visibleLogs()
+                  ? element("div", "padding:12px 20px", button("showMore", () => setVisibleLogs(visibleLogs() + 25)))
+                  : null,
+              ];
+            },
+          ],
+        });
+
         return createComponent(ui.SettingsLayout, {
-          title: "远程访问",
-          description: "管理远程监听、登录凭据与实时连接。",
-          actions: saveButton,
-          children: [setupSection, listenerSection, connectionSection],
+          get title() { return t("title"); },
+          get description() { return t("description"); },
+          children: [() => error() ? errorMessage : null, setupSection, listenerSection, connectionsSection, aliasesSection, logSection],
         });
       },
     });
   },
 });
-
-function pairingPreview(output) {
-  const block = document.createElement("div");
-  block.style.cssText = "padding:16px 20px;display:grid;gap:8px;overflow-wrap:anywhere;user-select:text";
-  const link = output.match(/https?:\/\/[^\s]+\/auth\/connect\/[^\s]+/)?.[0];
-  const rows = output.split(/\r?\n/).filter((line) => /^[ █▀▄]+$/.test(line) && /[█▀▄]/.test(line));
-  if (!rows.length) {
-    block.textContent = output;
-    return block;
-  }
-
-  const scale = 5;
-  const margin = 4;
-  const canvas = document.createElement("canvas");
-  canvas.width = (Math.max(...rows.map((line) => line.length)) + margin * 2) * scale;
-  canvas.height = (rows.length * 2 + margin * 2) * scale;
-  canvas.setAttribute("aria-label", "OpenCode 配对二维码");
-  const context = canvas.getContext("2d");
-  context.fillStyle = "#fff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.fillStyle = "#000";
-  rows.forEach((line, y) => Array.from(line).forEach((pixel, x) => {
-    if (pixel === "█" || pixel === "▀") context.fillRect((x + margin) * scale, (y * 2 + margin) * scale, scale, scale);
-    if (pixel === "█" || pixel === "▄") context.fillRect((x + margin) * scale, (y * 2 + margin + 1) * scale, scale, scale);
-  }));
-  const note = document.createElement("p");
-  note.textContent = "用 OpenCode App 扫码，或在远程浏览器打开一次性链接。有效期 5 分钟。";
-  block.append(canvas, note);
-  if (link) {
-    const text = document.createElement("p");
-    text.textContent = link;
-    block.append(text);
-  }
-  return block;
-}
   })(load, pluginModule, pluginExports);
 })(require, module, exports);

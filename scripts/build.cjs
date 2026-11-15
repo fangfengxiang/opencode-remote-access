@@ -9,7 +9,10 @@ if (argumentsList.length > 1 || (argumentsList.length === 1 && argumentsList[0] 
 
 const root = join(__dirname, "..");
 const read = (name) => readFileSync(join(root, "src", name), "utf8").trimEnd();
-const moduleNames = ["gateway.cjs", "main.cjs", "control.cjs"];
+const moduleNames = [
+  "gateway.cjs", "main.cjs", "control.cjs", "login-log.cjs",
+  "i18n.cjs", "pairing.cjs", "qrcode-generator.cjs", "source-filter.cjs",
+];
 const modules = moduleNames.map((name) => {
   return `  factories[${JSON.stringify(`./${name}`)}] = function (require, module, exports) {\n${read(name)}\n  };`;
 });

@@ -165,7 +165,8 @@ test("remote authentication, pairing, streams, connections and rotation", async 
     const raw = net.connect(Number(new URL(service.url).port), host);
     raw.on("error", () => raw.destroy());
     await once(raw, "connect");
-    assert.ok(service.peers().some((peer) => peer.ip === host && peer.count >= 2));
+    const sameIpConnections = service.peers().filter((peer) => peer.ip === host).reduce((total, peer) => total + peer.count, 0);
+    assert.ok(sameIpConnections >= 2);
     assert.ok(updates > 0);
 
     const oldAddress = service.url;
@@ -182,6 +183,145 @@ test("remote authentication, pairing, streams, connections and rotation", async 
     assert.equal(await status(service.url, { Authorization: basic(options.username, "fixture-rotated-secret") }), 200);
   } finally {
     await service.close();
+    await new Promise((resolve) => backend.close(resolve));
+  }
+});
+
+test("device identity, model metadata, and credential attempts without secret data", async () => {
+  const upstream = http.createServer((req, res) => {
+    assert.equal(req.headers.cookie, undefined);
+    if (req.url.startsWith("/auth/connect/")) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ token: "fixture-upstream-token" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html" }).end("<title>fixture</title>");
+  });
+  upstream.listen(0, host);
+  await once(upstream, "listening");
+
+  const attempts = [];
+  const options = {
+    host, port: 0, username: "fixture-remote", password: "fixture-remote-secret",
+    upstreamUrl: `http://${host}:${upstream.address().port}`,
+    deviceKey: randomBytes(32),
+    onLogin: (entry) => attempts.push(entry),
+  };
+  let service = await openGateway(options);
+  const mobile = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/ABC) Chrome/120.0",
+    "Sec-CH-UA-Model": '"Pixel 7"',
+    Accept: "text/html",
+  };
+  const request = (headers, path = "/") => fetch(service.url + path, { headers, redirect: "manual" });
+  try {
+    const challenge = await request(mobile);
+    assert.equal(challenge.status, 401);
+    assert.equal(challenge.headers.get("set-cookie"), null);
+    assert.deepEqual(attempts, []);
+
+    for (let i = 0; i < 2; i++) assert.equal((await request({ ...mobile, Authorization: wrong })).status, 401);
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0].success, false);
+
+    const first = await request({ ...mobile, Authorization: remote });
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get("set-cookie"), /opencode_remote_device=[^;]+; Path=\/;.*HttpOnly; SameSite=Lax/);
+    const deviceCookie = first.headers.get("set-cookie").split(";")[0];
+    const deviceId = attempts.at(-1).deviceId;
+    const keep = { ...mobile, Cookie: deviceCookie, Authorization: remote };
+    assert.match(deviceId, /^[A-Za-z0-9_-]{22}$/);
+    assert.equal(attempts.at(-1).deviceLabel, "Pixel 7 · Android · Chrome");
+    assert.equal(attempts.at(-1).local, true);
+    for (let i = 0; i < 3; i++) assert.equal((await request(keep)).status, 200);
+    assert.equal(attempts.length, 2);
+
+    const laterCookie = await new Promise((resolve, reject) => {
+      const probe = http.get(service.url, {
+        agent: false,
+        headers: { ...mobile, Authorization: remote, Cookie: "opencode_remote_device=bad.token" },
+      }, (response) => {
+        response.resume();
+        resolve(response.headers["set-cookie"][0].split(";")[0]);
+      });
+      probe.on("error", reject);
+    });
+    assert.notEqual(laterCookie, deviceCookie);
+
+    const nativeCode = randomBytes(16).toString("base64url");
+    const now = Date.now();
+    const expiresAt = service.allowPairing(nativeCode);
+    assert.ok(expiresAt - now >= 300000 && expiresAt - now < 301000);
+    const paired = await request({ Accept: "application/json", "User-Agent": "OpenCodeClient/1" }, `/auth/connect/${nativeCode}`);
+    assert.equal(paired.status, 200);
+    const { token } = await paired.json();
+    const pairedIdentity = attempts.at(-1).deviceId;
+    assert.equal(attempts.at(-1).method, "pair");
+    assert.match(attempts.at(-1).deviceLabel, /OpenCode App/);
+    assert.equal((await request({ Authorization: basic("native", token), "User-Agent": "OpenCodeClient/2" })).status, 200);
+    assert.ok(service.peers().some((entry) => entry.deviceId === pairedIdentity));
+    assert.doesNotMatch(JSON.stringify(attempts), /fixture-remote-secret|fixture-upstream-token|Mozilla\/5\.0/);
+
+    await service.close();
+    service = await openGateway({ ...options, password: "fixture-rotated-secret" });
+    assert.equal((await request({ ...mobile, Cookie: deviceCookie })).status, 401);
+    assert.equal((await request({ ...mobile, Cookie: deviceCookie, Authorization: remote })).status, 401);
+    assert.equal((await request({ ...mobile, Cookie: deviceCookie, Authorization: basic(options.username, "fixture-rotated-secret") })).status, 200);
+    assert.equal(attempts.at(-1).deviceId, deviceId);
+    assert.equal(attempts.at(-1).success, true);
+  } finally {
+    await service.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
+
+test("a nonempty source allowlist blocks HTTP, pairing and upgrades before authentication", async () => {
+  const { sourceFilter } = require("../src/source-filter.cjs");
+  assert.ok(sourceFilter("")("192.0.2.6"));
+  assert.ok(sourceFilter("192.0.2.6, 2001:db8::/48")("2001:db8::6"));
+  assert.ok(!sourceFilter("192.0.2.6, 2001:db8::/48")("192.0.2.7"));
+  assert.throws(() => sourceFilter("192.0.2.6/33"));
+  assert.throws(() => sourceFilter("example.invalid"));
+
+  let upstreamRequests = 0;
+  const backend = http.createServer((_request, response) => {
+    upstreamRequests++;
+    response.end("upstream");
+  });
+  backend.listen(0, host);
+  await once(backend, "listening");
+  const options = {
+    host,
+    port: 0,
+    username: "fixture-remote",
+    password: "fixture-remote-secret",
+    upstreamUrl: `http://${host}:${backend.address().port}`,
+    upstreamHeaders: { Authorization: native },
+  };
+  const events = [];
+  let gateway;
+  try {
+    gateway = await openGateway({ ...options, allowedSources: "192.0.2.6/32", onLogin: (event) => events.push(event) });
+    const authorization = { Authorization: remote, "X-Forwarded-For": "192.0.2.6" };
+    const response = await fetch(`${gateway.url}/api/info`, { headers: authorization });
+    assert.equal(response.status, 403);
+    await response.text();
+    const code = randomBytes(16).toString("base64url");
+    gateway.allowPairing(code);
+    assert.equal(await status(`${gateway.url}/auth/connect/${code}`, authorization), 403);
+    assert.equal((await upgrade(gateway.url, "/socket", remote)).code, 403);
+    assert.equal(gateway.peers().length, 0);
+    assert.equal(upstreamRequests, 0);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].method, "blocked");
+    assert.equal(events[0].success, false);
+    assert.equal(events[0].ip, host);
+    await gateway.close();
+
+    gateway = await openGateway({ ...options, allowedSources: "127.0.0.0/8" });
+    assert.equal(await status(`${gateway.url}/api/info`, { Authorization: remote }), 200);
+    assert.equal(upstreamRequests, 1);
+  } finally {
+    await gateway?.close();
     await new Promise((resolve) => backend.close(resolve));
   }
 });

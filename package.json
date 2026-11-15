@@ -13,6 +13,9 @@
   "license": "MIT",
   "author": "fangfengxiang",
   "contributors": [
-    "Codex"
+    {
+      "name": "Codex",
+      "url": "https://github.com/codex"
+    }
   ]
 }

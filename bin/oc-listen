@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import json
+import socket
+import sys
+from pathlib import Path
+
+
+def run():
+    pairing = Path(sys.argv[0]).name == "oc-qr"
+    if len(sys.argv) > 1:
+        raise ValueError("用法：oc-listen 或 oc-qr")
+    endpoint = Path.home() / ".opencode" / "remote-access" / "control.sock"
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(25)
+        try:
+            client.connect(str(endpoint))
+        except OSError as error:
+            raise ValueError("请先打开已安装远程访问插件的 OpenCode Desktop。") from error
+        client.sendall(b"pair\n" if pairing else b"listen\n")
+        with client.makefile("r", encoding="utf-8") as response:
+            reply = json.loads(response.readline(65536))
+            if not reply["ok"]:
+                raise ValueError(reply["message"])
+            result = reply["result"]
+            if pairing:
+                print(result)
+                return
+
+            print(f"地址 {result['url']}\n账号 {result['username']}")
+            if sys.stdout.isatty():
+                print(f"密码 {result['password']}")
+            if result["foreground"]:
+                print("按 Ctrl+C 停止监听。", flush=True)
+                client.settimeout(None)
+                while response.read(1):
+                    pass
+            else:
+                print("远程监听已经启动，可在桌面端停止。")
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"OpenCode 远程访问：{error}")

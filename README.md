@@ -2,6 +2,12 @@
 
 **简体中文** · [English](README.en.md)
 
+[![OpenCode v2 GUI](https://img.shields.io/badge/OpenCode-v2%20GUI-2563eb)](https://opencode.ai/docs/cli/plugins/)
+[![License MIT](https://img.shields.io/badge/License-MIT-eab308)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/fangfengxiang/opencode-remote-access?style=social&logo=github)](https://github.com/fangfengxiang/opencode-remote-access/stargazers)
+
+**运行要求：OpenCode Desktop v2，且支持 GUI 插件。**
+
 在 **OpenCode Desktop → 设置 → 远程访问**中管理监听地址、远程登录和设备。插件提供 HTTP 或 HTTPS Web 入口，支持密码登录、一次性配对和登录日志。设置页使用 OpenCode 原生组件，自动跟随桌面端语言，支持简体中文、繁體中文、English 和 Русский。
 
 ![远程访问设置页简体中文示例，密码已遮挡](docs/remote-access.png)

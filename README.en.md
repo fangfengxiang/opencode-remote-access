@@ -2,6 +2,12 @@
 
 [简体中文](README.md) · **English**
 
+[![OpenCode v2 GUI](https://img.shields.io/badge/OpenCode-v2%20GUI-2563eb)](https://opencode.ai/docs/cli/plugins/)
+[![License MIT](https://img.shields.io/badge/License-MIT-eab308)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/fangfengxiang/opencode-remote-access?style=social&logo=github)](https://github.com/fangfengxiang/opencode-remote-access/stargazers)
+
+**Requires OpenCode Desktop v2 with GUI plugin support.**
+
 Open **OpenCode Desktop → Settings → Remote Access** to manage the listener, sign-in credentials, and connected devices. The plugin provides HTTP or HTTPS access to the OpenCode web interface, with password sign-in, one-time pairing, and a sign-in log. Its native settings page follows the Desktop language and supports Simplified Chinese, Traditional Chinese, English, and Russian.
 
 ![The Remote Access settings page in English, with a masked example password](docs/remote-access-en.png)

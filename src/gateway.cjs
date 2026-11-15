@@ -1,5 +1,6 @@
 const { sourceFilter } = require("./source-filter.cjs");
 const http = require("node:http");
+const https = require("node:https");
 const net = require("node:net");
 const { Buffer } = require("node:buffer");
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require("node:crypto");
@@ -114,6 +115,7 @@ async function openGateway({
   password,
   upstreamUrl,
   upstreamHeaders = {},
+  tls,
   allowedSources = "",
   deviceKey = randomBytes(32),
   onChange = () => {},
@@ -139,10 +141,13 @@ async function openGateway({
   const expected = secretDigest(`${username}:${password}`);
   const key = randomBytes(32);
   const pairingCodes = new Map();
+  const wireSockets = new Set();
   const activeSockets = new Map();
   const recentLogins = new Map();
   const challenge = 'Basic realm="OpenCode Remote", charset="UTF-8"';
-  const bindHost = net.isIPv6(host) ? `[${host}]` : host;
+  const urlHost = tls?.hostname || (net.isIPv6(host) ? `[${host}]` : host);
+  const scheme = tls ? "https" : "http";
+  const cookieSecurity = tls ? "; Secure" : "";
   let url;
   let authority;
   let cookieName;
@@ -216,7 +221,7 @@ async function openGateway({
       socket.browserId ??= randomBytes(16).toString("base64url");
       id = socket.browserId;
       const token = `${id}.${deviceDigest(`cookie:${id}`)}`;
-      cookie = `${DEVICE_COOKIE}=${token}; Path=/; Max-Age=${DEVICE_SECONDS}; HttpOnly; SameSite=Lax`;
+      cookie = `${DEVICE_COOKIE}=${token}; Path=/; Max-Age=${DEVICE_SECONDS}; HttpOnly; SameSite=Lax${cookieSecurity}`;
     }
     id ||= socket.browserId || fallback;
     if (socket.deviceId !== id || socket.deviceLabel !== metadata.label) {
@@ -313,7 +318,7 @@ async function openGateway({
         const token = sessionToken(peer?.deviceId);
         recordLogin(peer, "pair", true);
         if (browser) {
-          const cookies = [`${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax`];
+          const cookies = [`${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax${cookieSecurity}`];
           if (peer?.cookie) cookies.push(peer.cookie);
           response.writeHead(302, {
             Location: "/",
@@ -333,7 +338,7 @@ async function openGateway({
   }
 
   function forward(request, response) {
-    if (activeSockets.get(request.socket)?.blocked) {
+    if (activeSockets.get(request.socket)?.blocked !== false) {
       request.resume();
       return reply(response, 403, "Source IP blocked.", { Connection: "close" });
     }
@@ -377,10 +382,12 @@ async function openGateway({
     request.pipe(outgoing);
   }
 
-  const server = http.createServer(forward);
+  const server = tls
+    ? https.createServer({ cert: tls.cert, key: tls.key, minVersion: tls.minVersion, handshakeTimeout: 10_000 }, forward)
+    : http.createServer(forward);
   server.on("upgrade", (request, client, clientHead) => {
     client.on("error", () => client.destroy());
-    if (activeSockets.get(client)?.blocked) return endUpgrade(client, 403);
+    if (activeSockets.get(client)?.blocked !== false) return endUpgrade(client, 403);
     const target = requestPath(request);
     if (!target || request.headers.upgrade?.toLowerCase() !== "websocket") {
       return endUpgrade(client, 400);
@@ -419,6 +426,11 @@ async function openGateway({
   });
 
   server.on("connection", (socket) => {
+    wireSockets.add(socket);
+    socket.once("close", () => wireSockets.delete(socket));
+  });
+
+  server.on(tls ? "secureConnection" : "connection", (socket) => {
     const ip = normalizedIP(socket.remoteAddress);
     const local = ip === normalizedIP(host) || ip === "::1" || (net.isIPv4(ip) && ip.startsWith("127."));
     const blocked = !permits(ip);
@@ -440,7 +452,7 @@ async function openGateway({
     server.once("error", reject);
     server.listen(port, host, () => {
       server.removeListener("error", reject);
-      const endpoint = new URL(`http://${bindHost}:${server.address().port}`);
+      const endpoint = new URL(`${scheme}://${urlHost}:${server.address().port}`);
       authority = endpoint.host;
       url = endpoint.origin;
       cookieName = `opencode_remote_session_${server.address().port}`;
@@ -481,7 +493,11 @@ async function openGateway({
     close() {
       if (closing) return closing;
       closing = new Promise((resolve) => server.close(resolve));
-      for (const socket of activeSockets.keys()) socket.destroy();
+      if (tls) {
+        for (const socket of activeSockets.keys()) socket.destroy();
+      }
+      for (const socket of wireSockets) socket.destroy();
+      wireSockets.clear();
       activeSockets.clear();
       pairingCodes.clear();
       recentLogins.clear();

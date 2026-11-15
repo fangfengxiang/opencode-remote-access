@@ -1,4 +1,4 @@
-const { shell } = require("electron");
+const { dialog, shell } = require("electron");
 const { Ipc } = require("@opencode/plugin/gui");
 const { Schema } = require("effect");
 const fs = require("node:fs/promises");
@@ -11,14 +11,23 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { createLoginLog } = require("./login-log.cjs");
 const { sourceFilter } = require("./source-filter.cjs");
+const { defaultHttps, validateHttps, listenerTls } = require("./tls.cjs");
 
-const configuration = Schema.Struct({
+const connectionFields = {
   listenHost: Schema.String,
   listenPort: Schema.Number,
   username: Schema.String,
   password: Schema.String,
   allowedSources: Schema.String,
+};
+const connection = Schema.Struct(connectionFields);
+const httpsSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  hostname: Schema.String,
+  certificatePath: Schema.String,
+  keyPath: Schema.String,
 });
+const configuration = Schema.Struct({ ...connectionFields, https: httpsSettings });
 const deviceFields = {
   ip: Schema.String,
   deviceId: Schema.String,
@@ -40,13 +49,15 @@ const listenerState = Schema.Struct({
   peers: Schema.Array(Schema.Struct({ ...deviceFields, count: Schema.Number, alias: Schema.String })),
   restarting: Schema.Boolean,
   restartPending: Schema.Boolean,
+  generatedCertificatePath: Schema.String,
 });
 const loginLogs = Schema.Array(Schema.Struct({ ...eventFields, alias: Schema.String }));
 const deviceAliases = Schema.Array(Schema.Struct(aliasFields));
 const loginLogSettings = { enabled: Schema.Boolean, path: Schema.String };
 const loginLogInfo = Schema.Struct({ ...loginLogSettings, size: Schema.Number });
 const Remote = Ipc.define({
-  id: "opencode-remote-access",
+  // Desktop caches window methods by IPC ID across plugin reloads.
+  id: "opencode-remote-access.v2",
   events: {
     listenerChanged: listenerState,
     loginLogsChanged: loginLogs,
@@ -62,8 +73,10 @@ const Remote = Ipc.define({
       configError: Schema.String,
       restartPending: Schema.Boolean,
     }) },
-    save: { input: configuration },
-    saveAndRestart: { input: configuration },
+    save: { input: connection },
+    saveAndRestart: { input: connection },
+    configureHttps: { input: httpsSettings, output: httpsSettings },
+    pickHttpsFile: { input: Schema.String, output: Schema.String },
     start: {},
     stop: {},
     openBrowser: {},
@@ -78,7 +91,7 @@ const Remote = Ipc.define({
   },
 });
 
-const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "" };
+const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "", https: defaultHttps };
 const aliasLimit = 300;
 const deviceIdPattern = /^[A-Za-z0-9_-]{22}$/u;
 const controlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -105,11 +118,16 @@ function validate(config, error) {
   } catch {
     throw error("error.allowlist");
   }
-  return { listenHost, listenPort, username, password, allowedSources: allowedSources.trim() };
+  return {
+    listenHost, listenPort, username, password,
+    allowedSources: allowedSources.trim(),
+    https: validateHttps(config.https, error),
+  };
 }
 
 function attachMain(ctx, { openGateway, openControl }) {
   const configPath = path.join(os.homedir(), ".opencode", "remote.json");
+  const tlsDirectory = path.join(path.dirname(configPath), "remote-access", "tls");
   const run = promisify(execFile);
   const problem = (key, values) => new Error(ctx.t(key, values));
   const deviceKeyStore = ctx.storage.store("device-key", { schema: Schema.String, initial: "" });
@@ -170,6 +188,7 @@ function attachMain(ctx, { openGateway, openControl }) {
       username: config.username ?? blankConfig.username,
       password: config.password ?? blankConfig.password,
       allowedSources: config.allowedSources ?? blankConfig.allowedSources,
+      https: validateHttps(config.https, problem),
     };
     if (typeof values.listenHost !== "string" || !Number.isInteger(values.listenPort) ||
         typeof values.username !== "string" || typeof values.password !== "string" ||
@@ -182,7 +201,8 @@ function attachMain(ctx, { openGateway, openControl }) {
 
   function pendingRestart() {
     return Boolean(active && savedConfig &&
-      Object.keys(savedConfig).some((key) => savedConfig[key] !== active.config[key]));
+      (Object.keys(connectionFields).some((key) => savedConfig[key] !== active.config[key]) ||
+        Object.keys(defaultHttps).some((key) => savedConfig.https[key] !== active.config.https[key])));
   }
 
   function displayDevice(device, host) {
@@ -205,6 +225,7 @@ function attachMain(ctx, { openGateway, openControl }) {
       })) || [],
       restarting,
       restartPending: pendingRestart(),
+      generatedCertificatePath: active?.tls?.generatedCertificatePath || "",
     };
   }
 
@@ -279,7 +300,7 @@ function attachMain(ctx, { openGateway, openControl }) {
     }
   }
 
-  async function bindGateway(config) {
+  async function bindGateway(config, tls) {
     const sidecar = currentSidecar();
     checkRemotePort(config, sidecar);
     if (!sidecar) throw problem("error.sidecarNotReady");
@@ -299,6 +320,7 @@ function attachMain(ctx, { openGateway, openControl }) {
         allowedSources: config.allowedSources,
         upstreamUrl: sidecar.endpoint.url,
         upstreamHeaders: sidecar.endpoint.headers ?? {},
+        tls,
         deviceKey: deviceKeyStore.value,
         onLogin: (event) => {
           if (bound && active === bound) recordLogin(event, config.listenHost);
@@ -307,7 +329,7 @@ function attachMain(ctx, { openGateway, openControl }) {
           if (bound && active === bound) notifyListener();
         },
       });
-      bound = { gateway, config };
+      bound = { gateway, config, tls };
       return bound;
     } catch (error) {
       if (error.code === "EADDRINUSE") throw problem("error.portInUse", { port: config.listenPort });
@@ -317,9 +339,15 @@ function attachMain(ctx, { openGateway, openControl }) {
     }
   }
 
+  function prepareTls(config) {
+    return listenerTls(config.https, config.listenHost, tlsDirectory, problem, ctx.signal);
+  }
+
   async function start(config) {
     if (active) return;
-    active = await bindGateway(validate(config, problem));
+    const next = validate(config, problem);
+    checkRemotePort(next, currentSidecar());
+    active = await bindGateway(next, await prepareTls(next));
     notifyListener();
   }
 
@@ -339,19 +367,23 @@ function attachMain(ctx, { openGateway, openControl }) {
     await closeGateway();
   }
 
-  async function save(input) {
-    const next = validate(input, problem);
+  async function withSavedHttps(input) {
+    const stored = await load().catch(() => savedConfig ?? active?.config ?? blankConfig);
+    const next = validate({ ...input, https: stored.https }, problem);
     checkRemotePort(next, currentSidecar());
+    return next;
+  }
+
+  async function save(input) {
+    const next = await withSavedHttps(input);
     await writeRemote(next);
     notifyListener();
   }
 
-  async function saveAndRestart(input) {
-    const next = validate(input, problem);
-    checkRemotePort(next, currentSidecar());
+  async function replaceListener(stored, next) {
     const previous = active;
     if (!previous) {
-      await writeRemote(next);
+      await writeRemote(stored);
       notifyListener();
       return;
     }
@@ -359,11 +391,12 @@ function attachMain(ctx, { openGateway, openControl }) {
     restarting = true;
     notifyListener();
     try {
+      const tls = await prepareTls(next);
       if (previous.config.listenHost !== next.listenHost || previous.config.listenPort !== next.listenPort) {
         // Validate the replacement binding before disturbing the active endpoint.
-        const replacement = await bindGateway(next);
+        const replacement = await bindGateway(next, tls);
         try {
-          await writeRemote(next);
+          await writeRemote(stored);
         } catch (error) {
           await replacement.gateway.close();
           throw error;
@@ -375,12 +408,12 @@ function attachMain(ctx, { openGateway, openControl }) {
 
       try {
         await closeGateway();
-        await start(next);
-        await writeRemote(next);
+        active = await bindGateway(next, tls);
+        await writeRemote(stored);
       } catch (error) {
         try {
           await closeGateway();
-          await start(previous.config);
+          active = await bindGateway(previous.config, previous.tls);
         } catch {
           controlLease = undefined;
           throw problem("error.restoreFailed");
@@ -390,6 +423,43 @@ function attachMain(ctx, { openGateway, openControl }) {
     } finally {
       restarting = false;
       notifyListener();
+    }
+  }
+
+  async function saveAndRestart(input) {
+    const next = await withSavedHttps(input);
+    await replaceListener(next, next);
+  }
+
+  async function configureHttps(input) {
+    const https = validateHttps(input, problem);
+    const stored = await load().catch(() => { throw problem("error.configRead"); });
+    const nextSaved = { ...stored, https };
+    if (!active || (!https.enabled && !active.config.https.enabled)) {
+      if (https.enabled && https.certificatePath) await prepareTls(nextSaved);
+      await writeRemote(nextSaved);
+      if (active) active.config = { ...active.config, https };
+      notifyListener();
+    } else {
+      await replaceListener(nextSaved, { ...active.config, https });
+    }
+    return https;
+  }
+
+  async function pickHttpsFile(kind) {
+    if (kind !== "certificate" && kind !== "key") throw problem("error.httpsSettings");
+    try {
+      const selection = await dialog.showOpenDialog({
+        title: ctx.t(kind === "certificate" ? "httpsCertificatePath" : "httpsKeyPath"),
+        properties: ["openFile"],
+        filters: [
+          { name: "PEM", extensions: ["pem", "crt", "key", "cert"] },
+          { name: ctx.t("httpsAllFiles"), extensions: ["*"] },
+        ],
+      });
+      return selection.canceled ? "" : selection.filePaths[0] || "";
+    } catch {
+      throw problem("error.httpsFilePicker");
     }
   }
 
@@ -413,7 +483,7 @@ function attachMain(ctx, { openGateway, openControl }) {
         const code = /^\/auth\/connect\/([A-Za-z0-9_-]{22})$/.exec(url.pathname)?.[1];
         if (url.origin === gateway.url && code && !url.search && !url.hash) {
           const expiresAt = gateway.allowPairing(code);
-          return { output, expiresAt };
+          return { output, expiresAt, link: url.href };
         }
       }
     } catch {
@@ -439,18 +509,22 @@ function attachMain(ctx, { openGateway, openControl }) {
     }),
     save: serial(save),
     saveAndRestart: serial(saveAndRestart),
+    configureHttps: serial(configureHttps),
+    pickHttpsFile: serial(pickHttpsFile),
     start: serial(async () => { if (!active) await start(await load()); }),
     stop: serial(stop),
     openBrowser: serial(async () => {
-      const { url } = listener();
-      if (!url) throw problem("error.listenerStopped");
+      const { link } = await pair();
       try {
-        await shell.openExternal(url);
+        await shell.openExternal(link);
       } catch {
         throw problem("error.browserFailed");
       }
     }),
-    pair: serial(pair),
+    pair: serial(async () => {
+      const { output, expiresAt } = await pair();
+      return { output, expiresAt };
+    }),
     loginLogs: listLoginLogs,
     loginLogInfo: () => loginLog.info(),
     configureLoginLog: serial(async (options) => { await loginLog.configure(options); }),
@@ -483,7 +557,7 @@ function attachMain(ctx, { openGateway, openControl }) {
     if (!disposing) ctx.log.write("warn", "OpenCode Remote Access terminal control unavailable");
   });
 
-  ctx.log.write("info", "OpenCode Remote Access activity controls loaded");
+  ctx.log.write("info", "OpenCode Remote Access HTTPS settings loaded");
   return async () => {
     disposing = true;
     await Promise.allSettled([

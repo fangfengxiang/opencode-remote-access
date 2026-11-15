@@ -11,6 +11,7 @@ const HEADER = '{"format":"opencode-remote-access/login-v1"}\n';
 const ENTRY_LIMIT = 500;
 const FILE_LIMIT = 1024 * 1024;
 const BATCH_LIMIT = 128;
+const defaultLogPath = "login.jsonl";
 
 function normalize(entry) {
   if (!entry || !Number.isSafeInteger(entry.timestamp) || !net.isIP(entry.ip) ||
@@ -29,10 +30,20 @@ function normalize(entry) {
 }
 
 function createLoginLog(ctx, { onChange }) {
+  const directory = path.join(os.homedir(), ".opencode", "remote-access");
+  const defaultFile = path.resolve(directory, defaultLogPath);
   const settings = ctx.storage.store("login-log-settings", {
     schema: Schema.Struct({ enabled: Schema.Boolean, path: Schema.String }),
-    initial: { enabled: true, path: path.join(os.homedir(), ".opencode", "remote-access", "login.jsonl") },
+    initial: { enabled: true, path: defaultLogPath },
   });
+  if (settings.value.path === defaultFile) {
+    try {
+      settings.set({ ...settings.value, path: defaultLogPath });
+    } catch {
+      ctx.log.write("warn", "Remote access could not normalize the saved login log path");
+    }
+  }
+  const selectedFile = () => path.resolve(directory, settings.value.path);
   let queue = Promise.resolve();
   let timer;
   let pending = [];
@@ -109,7 +120,7 @@ function createLoginLog(ctx, { onChange }) {
     const events = pending;
     pending = [];
     return enqueue(async () => {
-      const file = settings.value.path;
+      const file = selectedFile();
       const batch = events.filter((item) => item.file === file).map((item) => item.event);
       if (!batch.length) return;
       const current = await read(file);
@@ -119,11 +130,11 @@ function createLoginLog(ctx, { onChange }) {
   }
 
   return {
-    entries: () => enqueue(async () => (await read(settings.value.path)).entries),
+    entries: () => enqueue(async () => (await read(selectedFile())).entries),
     info: () => enqueue(async () => {
-      const current = settings.value;
-      const stat = await fs.lstat(current.path).catch(() => undefined);
-      return { ...current, size: stat && safeFile(stat) ? stat.size : 0 };
+      const file = selectedFile();
+      const stat = await fs.lstat(file).catch(() => undefined);
+      return { enabled: settings.value.enabled, path: file, size: stat && safeFile(stat) ? stat.size : 0 };
     }),
     async configure(next) {
       if (!path.isAbsolute(next.path) || next.path.includes("\0")) throw error("error.logPath");
@@ -131,14 +142,14 @@ function createLoginLog(ctx, { onChange }) {
       await flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));
       return enqueue(async () => {
         await read(file);
-        settings.set({ enabled: next.enabled, path: file });
+        settings.set({ enabled: next.enabled, path: file === defaultFile ? defaultLogPath : file });
         onChange();
       });
     },
     open: () => enqueue(async () => {
-      const file = settings.value.path;
+      const file = selectedFile();
       const current = await read(file);
-      if (!current.exists) await write(file, [], false);
+      if (!current.entries.length) return;
       if (await shell.openPath(file)) throw error("error.logOpen");
       onChange();
     }),
@@ -147,7 +158,7 @@ function createLoginLog(ctx, { onChange }) {
       timer = undefined;
       pending = [];
       return enqueue(async () => {
-        const file = settings.value.path;
+        const file = selectedFile();
         const current = await read(file);
         if (current.exists) await write(file, [], true);
         onChange();
@@ -159,7 +170,7 @@ function createLoginLog(ctx, { onChange }) {
       const entry = normalize(event);
       if (!entry) return;
       if (pending.length === BATCH_LIMIT) pending.shift();
-      pending.push({ file: current.path, event: entry });
+      pending.push({ file: selectedFile(), event: entry });
       if (!timer) {
         timer = setTimeout(() => {
           void flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));

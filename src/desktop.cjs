@@ -17,6 +17,10 @@ exports.default = Plugin.define({
     const remote = ctx.main(Remote);
     const ui = ctx.ui;
     const t = (key, values) => ctx.t(key, values);
+    function notifyError(failure) {
+      const description = failure?.message || String(failure ?? "");
+      if (description) ctx.toast.show({ variant: "error", title: t("operationFailed"), description, duration: 7000 });
+    }
     ctx.add(SettingsPage, {
       id: "opencode-remote-access",
       get title() { return t("title"); },
@@ -26,6 +30,7 @@ exports.default = Plugin.define({
           { id: "listen-address", title: t("listenAddress") },
           { id: "login", title: t("credentials") },
           { id: "listener", title: t("listenerStatus") },
+          { id: "https", title: t("httpsListener") },
           { id: "allowed-sources", title: t("allowedSources") },
           { id: "login-log-file", title: t("signInLogs") },
         ];
@@ -37,13 +42,15 @@ exports.default = Plugin.define({
         const portConflict = () => localPort() > 0 && Number(port()) === localPort();
         const [username, setUsername] = createSignal("");
         const [allowedSources, setAllowedSources] = createSignal("");
+        const [https, setHttps] = createSignal({ enabled: false, hostname: "", certificatePath: "", keyPath: "" });
         const [password, setPassword] = createSignal("");
         const [visible, setVisible] = createSignal(false);
         const [ready, setReady] = createSignal(false);
         const [busy, setBusy] = createSignal(false);
-        const [error, setError] = createSignal("");
         const [pairing, setPairing] = createSignal();
-        const [listener, setListener] = createSignal({ url: "", peers: [], restarting: false, restartPending: false });
+        const [listener, setListener] = createSignal({
+          url: "", peers: [], restarting: false, restartPending: false, generatedCertificatePath: "",
+        });
         const [restartRequested, setRestartRequested] = createSignal(false);
         const [savedNotice, setSavedNotice] = createSignal("");
         const [logInfo, setLogInfo] = createSignal({ enabled: false, path: "", size: 0 });
@@ -75,7 +82,7 @@ exports.default = Plugin.define({
           void get().then((value) => {
             if (mounted && !updated) apply(value);
           }).catch((failure) => {
-            if (mounted) setError(failure.message);
+            if (mounted) notifyError(failure);
           });
         }
         onCleanup(remote.on("listenerChanged", (snapshot) => {
@@ -87,7 +94,7 @@ exports.default = Plugin.define({
         subscribe("deviceAliasesChanged", () => remote.deviceAliases(), setAliases);
         void remote.listener().then((snapshot) => {
           if (!subscribedUpdate) setListener(snapshot);
-        }).catch((failure) => setError(failure.message));
+        }).catch(notifyError);
 
         async function refresh() {
           const state = await remote.status();
@@ -96,19 +103,19 @@ exports.default = Plugin.define({
           setLocalPort(state.localPort);
           setUsername(state.config.username);
           setAllowedSources(state.config.allowedSources);
+          setHttps(state.config.https);
           setPassword(state.config.password);
-          setError(state.configError);
+          notifyError(state.configError);
         }
-        void refresh().catch((failure) => setError(failure.message)).finally(() => setReady(true));
+        void refresh().catch(notifyError).finally(() => setReady(true));
 
         async function act(operation) {
           if (busy()) return;
           setBusy(true);
-          setError("");
           try {
             await operation();
           } catch (failure) {
-            setError(failure.message || String(failure));
+            notifyError(failure);
           } finally {
             setBusy(false);
           }
@@ -240,21 +247,95 @@ exports.default = Plugin.define({
           button("openBrowser", () => remote.openBrowser(), () => !active() || restarting()),
           button("generateQr", async () => setPairing(await remote.pair()), () => !active() || restarting()),
         ]);
-        const errorMessage = element("p", "color:var(--v2-state-fg-error, #bc322a);white-space:pre-wrap", error);
-        errorMessage.setAttribute("role", "alert");
-
-        function closeDialogButton(key, onClick, variant = "neutral") {
+        function dialogButton(key, onClick, variant = "neutral", disabled = () => false) {
           return createComponent(ui.Button, {
             size: "small", variant,
             get children() { return t(key); },
+            get disabled() { return disabled(); },
             onClick,
           });
         }
 
+        async function applyHttps(settings) {
+          const restart = active() && (https().enabled || settings.enabled);
+          if (restart) setRestartRequested(true);
+          try {
+            setHttps(await remote.configureHttps(settings));
+            updateListener(await remote.listener());
+          } finally {
+            if (restart) setRestartRequested(false);
+          }
+        }
+
+        function editCertificate() {
+          ctx.dialogs.open((dialog) => {
+            const [settings, setSettings] = createSignal({ ...https() });
+            const [picking, setPicking] = createSignal(false);
+            const unavailable = () => busy() || picking();
+            const update = (key, value) => setSettings((current) => ({ ...current, [key]: value }));
+            async function pick(key, kind) {
+              if (unavailable()) return;
+              setPicking(true);
+              try {
+                const file = await remote.pickHttpsFile(kind);
+                if (file) update(key, file);
+              } catch (failure) {
+                notifyError(failure);
+              } finally {
+                setPicking(false);
+              }
+            }
+            async function saveCertificate() {
+              if (unavailable()) return;
+              setBusy(true);
+              try {
+                await applyHttps(settings());
+                dialog.close();
+              } catch (failure) {
+                notifyError(failure);
+              } finally {
+                setBusy(false);
+              }
+            }
+            const filePicker = (key, kind) => dialogButton(
+              "httpsChooseFile", () => void pick(key, kind), "neutral", unavailable,
+            );
+            return createComponent(ui.Dialog, {
+              get title() { return t("httpsCertificateSettings"); },
+              get description() { return t("httpsCertificateHelp"); },
+              children: element("div", "display:grid;gap:12px;padding-block:4px", [
+                field("httpsHostname", () => settings().hostname, (value) => update("hostname", value), {
+                  placeholder: "httpsHostnamePlaceholder",
+                }),
+                field("httpsCertificatePath", () => settings().certificatePath, (value) => update("certificatePath", value), {
+                  control: filePicker("certificatePath", "certificate"),
+                }),
+                field("httpsKeyPath", () => settings().keyPath, (value) => update("keyPath", value), {
+                  control: filePicker("keyPath", "key"),
+                }),
+              ]),
+              footer: element("div", "display:flex;justify-content:flex-end;gap:6px", [
+                dialogButton("cancel", dialog.close, "neutral", unavailable),
+                dialogButton("save", () => void saveCertificate(), "contrast", unavailable),
+              ]),
+            });
+          });
+        }
+
+        const httpsControls = element("div", "display:flex;align-items:center;flex-wrap:wrap;gap:8px", [
+          button("httpsCertificateSettings", editCertificate, restarting),
+          createComponent(ui.Switch, {
+            get label() { return t("httpsListener"); },
+            hideLabel: true,
+            get checked() { return https().enabled; },
+            get disabled() { return !ready() || busy() || restarting(); },
+            onChange: (enabled) => void act(() => applyHttps({ ...https(), enabled })),
+          }),
+        ]);
+
         function editAlias(item) {
           ctx.dialogs.open((dialog) => {
             const [alias, setAlias] = createSignal(item.alias ?? "");
-            const [dialogError, setDialogError] = createSignal("");
             const [saving, setSaving] = createSignal(false);
             async function apply(value) {
               if (saving()) return;
@@ -263,7 +344,7 @@ exports.default = Plugin.define({
                 await remote.setDeviceAlias({ deviceId: item.deviceId, alias: value });
                 dialog.close();
               } catch (failure) {
-                setDialogError(failure.message);
+                notifyError(failure);
               } finally {
                 setSaving(false);
               }
@@ -276,12 +357,11 @@ exports.default = Plugin.define({
                 onInput: setAlias,
                 onSubmit: () => void apply(alias()),
               }),
-              element("p", "color:var(--v2-state-fg-error)", dialogError),
             ]);
             const footer = element("div", "display:flex;justify-content:flex-end;gap:6px", [
-              ...(item.alias ? [closeDialogButton("removeAlias", () => void apply(""), "danger")] : []),
-              closeDialogButton("cancel", dialog.close),
-              closeDialogButton("save", () => void apply(alias()), "contrast"),
+              ...(item.alias ? [dialogButton("removeAlias", () => void apply(""), "danger")] : []),
+              dialogButton("cancel", dialog.close),
+              dialogButton("save", () => void apply(alias()), "contrast"),
             ]);
             return createComponent(ui.Dialog, {
               get title() { return t("deviceAliases"); },
@@ -296,8 +376,8 @@ exports.default = Plugin.define({
             get title() { return t("clearLogsConfirm"); },
             get description() { return t("clearLogsDescription"); },
             footer: element("div", "display:flex;justify-content:flex-end;gap:6px", [
-              closeDialogButton("cancel", dialog.close),
-              closeDialogButton("clear", () => {
+              dialogButton("cancel", dialog.close),
+              dialogButton("clear", () => {
                 dialog.close();
                 void act(async () => {
                   await remote.clearLoginLogs();
@@ -351,6 +431,15 @@ exports.default = Plugin.define({
               if (listener().restartPending) return [listener().url, t("pending")].filter(Boolean).join(" · ");
               return listener().url || (!restarting() ? t("listenerHelp") : "");
             }, actions),
+            row("https", () => t("httpsListener"), element("div", "display:grid;gap:4px;overflow-wrap:anywhere", [
+              () => t("httpsHelp"),
+              () => listener().generatedCertificatePath
+                ? element("div", "display:grid;gap:4px", [
+                  () => t("httpsSelfSigned"),
+                  element("span", "user-select:text", () => listener().generatedCertificatePath),
+                ])
+                : null,
+            ]), httpsControls),
             () => pairing() ? pairingPreview(pairing(), t, ui) : null,
           ],
         });
@@ -400,18 +489,19 @@ exports.default = Plugin.define({
               setLogPath(info.path);
               setLogInfo(info);
             }, () => !logPath() || logPath() === logInfo().path),
-            button("openLogFile", () => remote.openLoginLog(), () => !logInfo().path),
+            button("openLogFile", () => remote.openLoginLog(), () => !logs().length),
           ]),
         ]);
-        const logActions = element("div", "padding:12px 20px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+        const logActions = element("div", "padding:12px 20px;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+          element("span", "margin-inline-end:auto;color:var(--v2-text-text-muted)", () => !logs().length && !showLogs() ? t("noLogs") : ""),
           button(() => t(showLogs() ? "hideLogs" : "viewLogs"), async () => {
             if (!showLogs()) {
               setLogs(await remote.loginLogs());
               setVisibleLogs(25);
             }
             setShowLogs(!showLogs());
-          }),
-          button("clearLogs", confirmClear, () => !logInfo().size),
+          }, () => !showLogs() && !logs().length),
+          button("clearLogs", confirmClear, () => !logs().length),
         ]);
         const logSection = createComponent(ui.SettingsSection, {
           get title() { return t("signInLogs"); },
@@ -448,7 +538,7 @@ exports.default = Plugin.define({
         return createComponent(ui.SettingsLayout, {
           get title() { return t("title"); },
           get description() { return t("description"); },
-          children: [() => error() ? errorMessage : null, setupSection, listenerSection, connectionsSection, aliasesSection, logSection],
+          children: [setupSection, listenerSection, connectionsSection, aliasesSection, logSection],
         });
       },
     });

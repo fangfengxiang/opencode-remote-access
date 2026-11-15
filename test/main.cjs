@@ -3,6 +3,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
+const { defaultHttps } = require("../src/tls.cjs");
 
 (async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "remote-main-fixture-"));
@@ -28,6 +29,7 @@ const vm = require("node:vm");
   const events = [];
   const cliCalls = [];
   const opened = [];
+  const pickedFiles = [];
   const allowedCodes = [];
   const pairCode = "mock-only-pair-code-01";
   const pairExpiry = 1_789_000_000_000;
@@ -55,7 +57,13 @@ const vm = require("node:vm");
       module: target,
       require: (id) => ({
         "./source-filter.cjs": require("../src/source-filter.cjs"),
-        electron: { shell: { openExternal: (url) => opened.push(url) } },
+        electron: {
+          shell: { openExternal: (url) => opened.push(url) },
+          dialog: { showOpenDialog: (options) => {
+            pickedFiles.push(options.title);
+            return { canceled: false, filePaths: [path.join(home, "fixture.pem")] };
+          } },
+        },
         "@opencode/plugin/gui": { Ipc: { define: (value) => value } },
         effect: { Schema: { Struct: (value) => value, Array: (value) => [value] } },
         "./login-log.cjs": {
@@ -82,6 +90,7 @@ const vm = require("node:vm");
             flush: async () => {},
           }),
         },
+        "./tls.cjs": require("../src/tls.cjs"),
         "node:os": {
           homedir: () => home,
           networkInterfaces: () => ({ fixture: [{ address: listenHost }, { address: otherHost }] }),
@@ -113,7 +122,8 @@ const vm = require("node:vm");
         if (!stores.has(key)) stores.set(key, initial);
         return { get value() { return stores.get(key); }, set: (value) => stores.set(key, value) };
       } },
-      provide: (_schema, impl) => {
+      provide: (schema, impl) => {
+        assert.equal(schema.id, "opencode-remote-access.v2");
         methods = impl;
         return { emit: (event, data) => {
           guiEvents.push({ event, data });
@@ -130,7 +140,7 @@ const vm = require("node:vm");
         assert.equal(params.upstreamUrl, "http://localhost:54789");
         assert.equal(params.upstreamHeaders.authorization, "Basic fixture-only");
         return {
-          url: `http://${params.host}:${params.port}`,
+          url: `${params.tls ? "https" : "http"}://${params.host}:${params.port}`,
           peers: () => [{ ip: params.host, deviceId, deviceLabel: "Fixture browser", local: false, count: 1 }],
           allowPairing: (code) => { allowedCodes.push(code); return pairExpiry; },
           clearLoginDebounce: () => { clearedDebounce += 1; },
@@ -141,7 +151,7 @@ const vm = require("node:vm");
     });
 
     assert.deepEqual(JSON.parse(JSON.stringify((await methods.status()).config)), {
-      listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "",
+      listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "", https: defaultHttps,
     });
     await assert.rejects(methods.start(), /error.invalidIp/);
     await assert.rejects(methods.save({ ...initial, listenHost: "0.0.0.0" }), /error.invalidIp/);
@@ -150,9 +160,12 @@ const vm = require("node:vm");
     assert.equal((await methods.status()).localPort, 54789);
 
     await assert.rejects(methods.save({ ...initial, allowedSources: "192.0.2.0/70" }), /error.allowlist/);
+    await fs.mkdir(path.dirname(configFile), { recursive: true });
+    await fs.writeFile(configFile, JSON.stringify(initial), { mode: 0o600 });
+    assert.equal((await methods.status()).config.https.enabled, false);
     await methods.save(initial);
-    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), initial);
-    assert.equal((await fs.stat(configFile)).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), { ...initial, https: defaultHttps });
+    if (process.platform !== "win32") assert.equal((await fs.stat(configFile)).mode & 0o777, 0o600);
     const claimed = await controller.start();
     assert.ok(claimed.lease);
     assert.equal(claimed.snapshot.url, `http://${listenHost}:${initial.listenPort}`);
@@ -160,13 +173,13 @@ const vm = require("node:vm");
     await controller.stop("incorrect-lease");
     assert.equal(methods.listener().url, claimed.snapshot.url);
     await methods.openBrowser();
-    assert.deepEqual(opened, [claimed.snapshot.url]);
+    assert.deepEqual(opened, [`${claimed.snapshot.url}/auth/connect/${pairCode}`]);
     const paired = await methods.pair();
     assert.equal(paired.output, `${claimed.snapshot.url}/auth/connect/${pairCode}`);
     assert.equal(paired.expiresAt, pairExpiry);
     assert.equal(await controller.pair(), paired.output);
-    assert.deepEqual(allowedCodes, [pairCode, pairCode]);
-    assert.deepEqual(cliCalls, Array(2).fill({
+    assert.deepEqual(allowedCodes, [pairCode, pairCode, pairCode]);
+    assert.deepEqual(cliCalls, Array(3).fill({
       command: "fixture-cli",
       args: ["desktop-relative-prefix", "pair", "--url", claimed.snapshot.url],
     }));
@@ -204,7 +217,7 @@ const vm = require("node:vm");
     assert.equal((await controller.credentials()).password, initial.password);
     assert.equal(methods.listener().restartPending, true);
     assert.equal((await methods.status()).restartPending, true);
-    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), changed);
+    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), { ...changed, https: defaultHttps });
 
     await methods.saveAndRestart(changed);
     assert.equal(starts.length, 2);
@@ -216,7 +229,7 @@ const vm = require("node:vm");
     assert.equal(starts[1].password, changed.password);
     assert.equal((await controller.credentials()).username, changed.username);
     assert.deepEqual(stops, [1]);
-    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), changed);
+    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), { ...changed, https: defaultHttps });
 
     await assert.rejects(methods.save({ ...changed, listenHost: otherHost, listenPort: 54789 }), /54789/);
     assert.equal(methods.listener().url, claimed.snapshot.url);
@@ -226,13 +239,42 @@ const vm = require("node:vm");
     assert.equal(methods.listener().url, claimed.snapshot.url);
     assert.equal(starts.at(-1).username, changed.username);
     assert.deepEqual(stops, [1]);
-    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), changed);
+    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), { ...changed, https: defaultHttps });
 
     writeError = "simulated config rename failure";
     await assert.rejects(methods.saveAndRestart({ ...changed, password: initial.password }), /error.saveFailed/);
-    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), changed);
+    assert.deepEqual(JSON.parse(await fs.readFile(configFile)), { ...changed, https: defaultHttps });
     assert.equal((await controller.credentials()).password, changed.password);
     assert.deepEqual(await fs.readdir(path.dirname(configFile)), ["remote.json"]);
+    writeError = undefined;
+    assert.equal(await methods.pickHttpsFile("certificate"), path.join(home, "fixture.pem"));
+    assert.equal(pickedFiles[0], "httpsCertificatePath");
+
+    const staged = { ...changed, listenPort: changed.listenPort + 2 };
+    await methods.save(staged);
+    const stopsBeforeHttps = stops.length;
+    await assert.rejects(methods.configureHttps({
+      ...defaultHttps, enabled: true, certificatePath: path.join(home, "missing.pem"), keyPath: path.join(home, "missing.key"),
+    }), /error.httpsRead/);
+    assert.equal(stops.length, stopsBeforeHttps);
+    assert.equal(methods.listener().url, claimed.snapshot.url);
+
+    await methods.configureHttps({ ...defaultHttps, enabled: true });
+    assert.equal(methods.listener().url, claimed.snapshot.url.replace("http:", "https:"));
+    assert.equal(methods.listener().restartPending, true);
+    assert.equal(starts.at(-1).port, changed.listenPort);
+    assert.equal((await methods.status()).config.listenPort, staged.listenPort);
+    assert.ok(methods.listener().generatedCertificatePath.startsWith(home));
+    assert.ok((await methods.pair()).output.startsWith("https://"));
+
+    const activeMaterial = starts.at(-1).tls;
+    writeError = "simulated write failure";
+    await assert.rejects(methods.configureHttps(defaultHttps), /error.saveFailed/);
+    assert.equal(starts.at(-1).tls, activeMaterial);
+    assert.match(methods.listener().url, /^https:/);
+    writeError = undefined;
+    await methods.configureHttps(defaultHttps);
+    assert.equal(methods.listener().url, claimed.snapshot.url);
 
     await controller.stop(claimed.lease);
     assert.equal(methods.listener().url, "");
@@ -242,7 +284,7 @@ const vm = require("node:vm");
     await assert.rejects(methods.start(), /54789/);
     assert.equal(methods.listener().url, "");
 
-    console.log("PASS: validation, save-only and staged restart, rollback, pair expiration, local peer labels, alias changes and login log controls.");
+    console.log("PASS: staged settings, listener and HTTPS rollback, pairing, local labels, aliases and log controls.");
   } finally {
     await close?.();
     await fs.rm(home, { recursive: true, force: true });

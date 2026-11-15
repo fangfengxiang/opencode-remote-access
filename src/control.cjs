@@ -27,6 +27,8 @@ async function removeStaleSocket(socketPath) {
 }
 
 async function openControl(handlers) {
+  // The optional terminal shortcuts use a Unix socket. The Desktop IPC is independent.
+  if (process.platform === "win32") return;
   const directory = path.join(os.homedir(), ".opencode", "remote-access");
   const socketPath = path.join(directory, "control.sock");
   await fs.mkdir(directory, { mode: 0o700, recursive: true });

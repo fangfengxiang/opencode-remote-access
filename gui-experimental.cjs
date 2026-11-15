@@ -4,6 +4,7 @@
   factories["./gateway.cjs"] = function (require, module, exports) {
 const { sourceFilter } = require("./source-filter.cjs");
 const http = require("node:http");
+const https = require("node:https");
 const net = require("node:net");
 const { Buffer } = require("node:buffer");
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require("node:crypto");
@@ -118,6 +119,7 @@ async function openGateway({
   password,
   upstreamUrl,
   upstreamHeaders = {},
+  tls,
   allowedSources = "",
   deviceKey = randomBytes(32),
   onChange = () => {},
@@ -143,10 +145,13 @@ async function openGateway({
   const expected = secretDigest(`${username}:${password}`);
   const key = randomBytes(32);
   const pairingCodes = new Map();
+  const wireSockets = new Set();
   const activeSockets = new Map();
   const recentLogins = new Map();
   const challenge = 'Basic realm="OpenCode Remote", charset="UTF-8"';
-  const bindHost = net.isIPv6(host) ? `[${host}]` : host;
+  const urlHost = tls?.hostname || (net.isIPv6(host) ? `[${host}]` : host);
+  const scheme = tls ? "https" : "http";
+  const cookieSecurity = tls ? "; Secure" : "";
   let url;
   let authority;
   let cookieName;
@@ -220,7 +225,7 @@ async function openGateway({
       socket.browserId ??= randomBytes(16).toString("base64url");
       id = socket.browserId;
       const token = `${id}.${deviceDigest(`cookie:${id}`)}`;
-      cookie = `${DEVICE_COOKIE}=${token}; Path=/; Max-Age=${DEVICE_SECONDS}; HttpOnly; SameSite=Lax`;
+      cookie = `${DEVICE_COOKIE}=${token}; Path=/; Max-Age=${DEVICE_SECONDS}; HttpOnly; SameSite=Lax${cookieSecurity}`;
     }
     id ||= socket.browserId || fallback;
     if (socket.deviceId !== id || socket.deviceLabel !== metadata.label) {
@@ -317,7 +322,7 @@ async function openGateway({
         const token = sessionToken(peer?.deviceId);
         recordLogin(peer, "pair", true);
         if (browser) {
-          const cookies = [`${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax`];
+          const cookies = [`${cookieName}=${token}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; SameSite=Lax${cookieSecurity}`];
           if (peer?.cookie) cookies.push(peer.cookie);
           response.writeHead(302, {
             Location: "/",
@@ -337,7 +342,7 @@ async function openGateway({
   }
 
   function forward(request, response) {
-    if (activeSockets.get(request.socket)?.blocked) {
+    if (activeSockets.get(request.socket)?.blocked !== false) {
       request.resume();
       return reply(response, 403, "Source IP blocked.", { Connection: "close" });
     }
@@ -381,10 +386,12 @@ async function openGateway({
     request.pipe(outgoing);
   }
 
-  const server = http.createServer(forward);
+  const server = tls
+    ? https.createServer({ cert: tls.cert, key: tls.key, minVersion: tls.minVersion, handshakeTimeout: 10_000 }, forward)
+    : http.createServer(forward);
   server.on("upgrade", (request, client, clientHead) => {
     client.on("error", () => client.destroy());
-    if (activeSockets.get(client)?.blocked) return endUpgrade(client, 403);
+    if (activeSockets.get(client)?.blocked !== false) return endUpgrade(client, 403);
     const target = requestPath(request);
     if (!target || request.headers.upgrade?.toLowerCase() !== "websocket") {
       return endUpgrade(client, 400);
@@ -423,6 +430,11 @@ async function openGateway({
   });
 
   server.on("connection", (socket) => {
+    wireSockets.add(socket);
+    socket.once("close", () => wireSockets.delete(socket));
+  });
+
+  server.on(tls ? "secureConnection" : "connection", (socket) => {
     const ip = normalizedIP(socket.remoteAddress);
     const local = ip === normalizedIP(host) || ip === "::1" || (net.isIPv4(ip) && ip.startsWith("127."));
     const blocked = !permits(ip);
@@ -444,7 +456,7 @@ async function openGateway({
     server.once("error", reject);
     server.listen(port, host, () => {
       server.removeListener("error", reject);
-      const endpoint = new URL(`http://${bindHost}:${server.address().port}`);
+      const endpoint = new URL(`${scheme}://${urlHost}:${server.address().port}`);
       authority = endpoint.host;
       url = endpoint.origin;
       cookieName = `opencode_remote_session_${server.address().port}`;
@@ -485,7 +497,11 @@ async function openGateway({
     close() {
       if (closing) return closing;
       closing = new Promise((resolve) => server.close(resolve));
-      for (const socket of activeSockets.keys()) socket.destroy();
+      if (tls) {
+        for (const socket of activeSockets.keys()) socket.destroy();
+      }
+      for (const socket of wireSockets) socket.destroy();
+      wireSockets.clear();
       activeSockets.clear();
       pairingCodes.clear();
       recentLogins.clear();
@@ -497,7 +513,7 @@ async function openGateway({
 module.exports = { openGateway };
   };
   factories["./main.cjs"] = function (require, module, exports) {
-const { shell } = require("electron");
+const { dialog, shell } = require("electron");
 const { Ipc } = require("@opencode/plugin/gui");
 const { Schema } = require("effect");
 const fs = require("node:fs/promises");
@@ -510,14 +526,23 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { createLoginLog } = require("./login-log.cjs");
 const { sourceFilter } = require("./source-filter.cjs");
+const { defaultHttps, validateHttps, listenerTls } = require("./tls.cjs");
 
-const configuration = Schema.Struct({
+const connectionFields = {
   listenHost: Schema.String,
   listenPort: Schema.Number,
   username: Schema.String,
   password: Schema.String,
   allowedSources: Schema.String,
+};
+const connection = Schema.Struct(connectionFields);
+const httpsSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  hostname: Schema.String,
+  certificatePath: Schema.String,
+  keyPath: Schema.String,
 });
+const configuration = Schema.Struct({ ...connectionFields, https: httpsSettings });
 const deviceFields = {
   ip: Schema.String,
   deviceId: Schema.String,
@@ -539,13 +564,15 @@ const listenerState = Schema.Struct({
   peers: Schema.Array(Schema.Struct({ ...deviceFields, count: Schema.Number, alias: Schema.String })),
   restarting: Schema.Boolean,
   restartPending: Schema.Boolean,
+  generatedCertificatePath: Schema.String,
 });
 const loginLogs = Schema.Array(Schema.Struct({ ...eventFields, alias: Schema.String }));
 const deviceAliases = Schema.Array(Schema.Struct(aliasFields));
 const loginLogSettings = { enabled: Schema.Boolean, path: Schema.String };
 const loginLogInfo = Schema.Struct({ ...loginLogSettings, size: Schema.Number });
 const Remote = Ipc.define({
-  id: "opencode-remote-access",
+  // Desktop caches window methods by IPC ID across plugin reloads.
+  id: "opencode-remote-access.v2",
   events: {
     listenerChanged: listenerState,
     loginLogsChanged: loginLogs,
@@ -561,8 +588,10 @@ const Remote = Ipc.define({
       configError: Schema.String,
       restartPending: Schema.Boolean,
     }) },
-    save: { input: configuration },
-    saveAndRestart: { input: configuration },
+    save: { input: connection },
+    saveAndRestart: { input: connection },
+    configureHttps: { input: httpsSettings, output: httpsSettings },
+    pickHttpsFile: { input: Schema.String, output: Schema.String },
     start: {},
     stop: {},
     openBrowser: {},
@@ -577,7 +606,7 @@ const Remote = Ipc.define({
   },
 });
 
-const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "" };
+const blankConfig = { listenHost: "", listenPort: 0, username: "", password: "", allowedSources: "", https: defaultHttps };
 const aliasLimit = 300;
 const deviceIdPattern = /^[A-Za-z0-9_-]{22}$/u;
 const controlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -604,11 +633,16 @@ function validate(config, error) {
   } catch {
     throw error("error.allowlist");
   }
-  return { listenHost, listenPort, username, password, allowedSources: allowedSources.trim() };
+  return {
+    listenHost, listenPort, username, password,
+    allowedSources: allowedSources.trim(),
+    https: validateHttps(config.https, error),
+  };
 }
 
 function attachMain(ctx, { openGateway, openControl }) {
   const configPath = path.join(os.homedir(), ".opencode", "remote.json");
+  const tlsDirectory = path.join(path.dirname(configPath), "remote-access", "tls");
   const run = promisify(execFile);
   const problem = (key, values) => new Error(ctx.t(key, values));
   const deviceKeyStore = ctx.storage.store("device-key", { schema: Schema.String, initial: "" });
@@ -669,6 +703,7 @@ function attachMain(ctx, { openGateway, openControl }) {
       username: config.username ?? blankConfig.username,
       password: config.password ?? blankConfig.password,
       allowedSources: config.allowedSources ?? blankConfig.allowedSources,
+      https: validateHttps(config.https, problem),
     };
     if (typeof values.listenHost !== "string" || !Number.isInteger(values.listenPort) ||
         typeof values.username !== "string" || typeof values.password !== "string" ||
@@ -681,7 +716,8 @@ function attachMain(ctx, { openGateway, openControl }) {
 
   function pendingRestart() {
     return Boolean(active && savedConfig &&
-      Object.keys(savedConfig).some((key) => savedConfig[key] !== active.config[key]));
+      (Object.keys(connectionFields).some((key) => savedConfig[key] !== active.config[key]) ||
+        Object.keys(defaultHttps).some((key) => savedConfig.https[key] !== active.config.https[key])));
   }
 
   function displayDevice(device, host) {
@@ -704,6 +740,7 @@ function attachMain(ctx, { openGateway, openControl }) {
       })) || [],
       restarting,
       restartPending: pendingRestart(),
+      generatedCertificatePath: active?.tls?.generatedCertificatePath || "",
     };
   }
 
@@ -778,7 +815,7 @@ function attachMain(ctx, { openGateway, openControl }) {
     }
   }
 
-  async function bindGateway(config) {
+  async function bindGateway(config, tls) {
     const sidecar = currentSidecar();
     checkRemotePort(config, sidecar);
     if (!sidecar) throw problem("error.sidecarNotReady");
@@ -798,6 +835,7 @@ function attachMain(ctx, { openGateway, openControl }) {
         allowedSources: config.allowedSources,
         upstreamUrl: sidecar.endpoint.url,
         upstreamHeaders: sidecar.endpoint.headers ?? {},
+        tls,
         deviceKey: deviceKeyStore.value,
         onLogin: (event) => {
           if (bound && active === bound) recordLogin(event, config.listenHost);
@@ -806,7 +844,7 @@ function attachMain(ctx, { openGateway, openControl }) {
           if (bound && active === bound) notifyListener();
         },
       });
-      bound = { gateway, config };
+      bound = { gateway, config, tls };
       return bound;
     } catch (error) {
       if (error.code === "EADDRINUSE") throw problem("error.portInUse", { port: config.listenPort });
@@ -816,9 +854,15 @@ function attachMain(ctx, { openGateway, openControl }) {
     }
   }
 
+  function prepareTls(config) {
+    return listenerTls(config.https, config.listenHost, tlsDirectory, problem, ctx.signal);
+  }
+
   async function start(config) {
     if (active) return;
-    active = await bindGateway(validate(config, problem));
+    const next = validate(config, problem);
+    checkRemotePort(next, currentSidecar());
+    active = await bindGateway(next, await prepareTls(next));
     notifyListener();
   }
 
@@ -838,19 +882,23 @@ function attachMain(ctx, { openGateway, openControl }) {
     await closeGateway();
   }
 
-  async function save(input) {
-    const next = validate(input, problem);
+  async function withSavedHttps(input) {
+    const stored = await load().catch(() => savedConfig ?? active?.config ?? blankConfig);
+    const next = validate({ ...input, https: stored.https }, problem);
     checkRemotePort(next, currentSidecar());
+    return next;
+  }
+
+  async function save(input) {
+    const next = await withSavedHttps(input);
     await writeRemote(next);
     notifyListener();
   }
 
-  async function saveAndRestart(input) {
-    const next = validate(input, problem);
-    checkRemotePort(next, currentSidecar());
+  async function replaceListener(stored, next) {
     const previous = active;
     if (!previous) {
-      await writeRemote(next);
+      await writeRemote(stored);
       notifyListener();
       return;
     }
@@ -858,11 +906,12 @@ function attachMain(ctx, { openGateway, openControl }) {
     restarting = true;
     notifyListener();
     try {
+      const tls = await prepareTls(next);
       if (previous.config.listenHost !== next.listenHost || previous.config.listenPort !== next.listenPort) {
         // Validate the replacement binding before disturbing the active endpoint.
-        const replacement = await bindGateway(next);
+        const replacement = await bindGateway(next, tls);
         try {
-          await writeRemote(next);
+          await writeRemote(stored);
         } catch (error) {
           await replacement.gateway.close();
           throw error;
@@ -874,12 +923,12 @@ function attachMain(ctx, { openGateway, openControl }) {
 
       try {
         await closeGateway();
-        await start(next);
-        await writeRemote(next);
+        active = await bindGateway(next, tls);
+        await writeRemote(stored);
       } catch (error) {
         try {
           await closeGateway();
-          await start(previous.config);
+          active = await bindGateway(previous.config, previous.tls);
         } catch {
           controlLease = undefined;
           throw problem("error.restoreFailed");
@@ -889,6 +938,43 @@ function attachMain(ctx, { openGateway, openControl }) {
     } finally {
       restarting = false;
       notifyListener();
+    }
+  }
+
+  async function saveAndRestart(input) {
+    const next = await withSavedHttps(input);
+    await replaceListener(next, next);
+  }
+
+  async function configureHttps(input) {
+    const https = validateHttps(input, problem);
+    const stored = await load().catch(() => { throw problem("error.configRead"); });
+    const nextSaved = { ...stored, https };
+    if (!active || (!https.enabled && !active.config.https.enabled)) {
+      if (https.enabled && https.certificatePath) await prepareTls(nextSaved);
+      await writeRemote(nextSaved);
+      if (active) active.config = { ...active.config, https };
+      notifyListener();
+    } else {
+      await replaceListener(nextSaved, { ...active.config, https });
+    }
+    return https;
+  }
+
+  async function pickHttpsFile(kind) {
+    if (kind !== "certificate" && kind !== "key") throw problem("error.httpsSettings");
+    try {
+      const selection = await dialog.showOpenDialog({
+        title: ctx.t(kind === "certificate" ? "httpsCertificatePath" : "httpsKeyPath"),
+        properties: ["openFile"],
+        filters: [
+          { name: "PEM", extensions: ["pem", "crt", "key", "cert"] },
+          { name: ctx.t("httpsAllFiles"), extensions: ["*"] },
+        ],
+      });
+      return selection.canceled ? "" : selection.filePaths[0] || "";
+    } catch {
+      throw problem("error.httpsFilePicker");
     }
   }
 
@@ -912,7 +998,7 @@ function attachMain(ctx, { openGateway, openControl }) {
         const code = /^\/auth\/connect\/([A-Za-z0-9_-]{22})$/.exec(url.pathname)?.[1];
         if (url.origin === gateway.url && code && !url.search && !url.hash) {
           const expiresAt = gateway.allowPairing(code);
-          return { output, expiresAt };
+          return { output, expiresAt, link: url.href };
         }
       }
     } catch {
@@ -938,18 +1024,22 @@ function attachMain(ctx, { openGateway, openControl }) {
     }),
     save: serial(save),
     saveAndRestart: serial(saveAndRestart),
+    configureHttps: serial(configureHttps),
+    pickHttpsFile: serial(pickHttpsFile),
     start: serial(async () => { if (!active) await start(await load()); }),
     stop: serial(stop),
     openBrowser: serial(async () => {
-      const { url } = listener();
-      if (!url) throw problem("error.listenerStopped");
+      const { link } = await pair();
       try {
-        await shell.openExternal(url);
+        await shell.openExternal(link);
       } catch {
         throw problem("error.browserFailed");
       }
     }),
-    pair: serial(pair),
+    pair: serial(async () => {
+      const { output, expiresAt } = await pair();
+      return { output, expiresAt };
+    }),
     loginLogs: listLoginLogs,
     loginLogInfo: () => loginLog.info(),
     configureLoginLog: serial(async (options) => { await loginLog.configure(options); }),
@@ -982,7 +1072,7 @@ function attachMain(ctx, { openGateway, openControl }) {
     if (!disposing) ctx.log.write("warn", "OpenCode Remote Access terminal control unavailable");
   });
 
-  ctx.log.write("info", "OpenCode Remote Access activity controls loaded");
+  ctx.log.write("info", "OpenCode Remote Access HTTPS settings loaded");
   return async () => {
     disposing = true;
     await Promise.allSettled([
@@ -1025,6 +1115,8 @@ async function removeStaleSocket(socketPath) {
 }
 
 async function openControl(handlers) {
+  // The optional terminal shortcuts use a Unix socket. The Desktop IPC is independent.
+  if (process.platform === "win32") return;
   const directory = path.join(os.homedir(), ".opencode", "remote-access");
   const socketPath = path.join(directory, "control.sock");
   await fs.mkdir(directory, { mode: 0o700, recursive: true });
@@ -1137,6 +1229,7 @@ const HEADER = '{"format":"opencode-remote-access/login-v1"}\n';
 const ENTRY_LIMIT = 500;
 const FILE_LIMIT = 1024 * 1024;
 const BATCH_LIMIT = 128;
+const defaultLogPath = "login.jsonl";
 
 function normalize(entry) {
   if (!entry || !Number.isSafeInteger(entry.timestamp) || !net.isIP(entry.ip) ||
@@ -1155,10 +1248,20 @@ function normalize(entry) {
 }
 
 function createLoginLog(ctx, { onChange }) {
+  const directory = path.join(os.homedir(), ".opencode", "remote-access");
+  const defaultFile = path.resolve(directory, defaultLogPath);
   const settings = ctx.storage.store("login-log-settings", {
     schema: Schema.Struct({ enabled: Schema.Boolean, path: Schema.String }),
-    initial: { enabled: true, path: path.join(os.homedir(), ".opencode", "remote-access", "login.jsonl") },
+    initial: { enabled: true, path: defaultLogPath },
   });
+  if (settings.value.path === defaultFile) {
+    try {
+      settings.set({ ...settings.value, path: defaultLogPath });
+    } catch {
+      ctx.log.write("warn", "Remote access could not normalize the saved login log path");
+    }
+  }
+  const selectedFile = () => path.resolve(directory, settings.value.path);
   let queue = Promise.resolve();
   let timer;
   let pending = [];
@@ -1235,7 +1338,7 @@ function createLoginLog(ctx, { onChange }) {
     const events = pending;
     pending = [];
     return enqueue(async () => {
-      const file = settings.value.path;
+      const file = selectedFile();
       const batch = events.filter((item) => item.file === file).map((item) => item.event);
       if (!batch.length) return;
       const current = await read(file);
@@ -1245,11 +1348,11 @@ function createLoginLog(ctx, { onChange }) {
   }
 
   return {
-    entries: () => enqueue(async () => (await read(settings.value.path)).entries),
+    entries: () => enqueue(async () => (await read(selectedFile())).entries),
     info: () => enqueue(async () => {
-      const current = settings.value;
-      const stat = await fs.lstat(current.path).catch(() => undefined);
-      return { ...current, size: stat && safeFile(stat) ? stat.size : 0 };
+      const file = selectedFile();
+      const stat = await fs.lstat(file).catch(() => undefined);
+      return { enabled: settings.value.enabled, path: file, size: stat && safeFile(stat) ? stat.size : 0 };
     }),
     async configure(next) {
       if (!path.isAbsolute(next.path) || next.path.includes("\0")) throw error("error.logPath");
@@ -1257,14 +1360,14 @@ function createLoginLog(ctx, { onChange }) {
       await flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));
       return enqueue(async () => {
         await read(file);
-        settings.set({ enabled: next.enabled, path: file });
+        settings.set({ enabled: next.enabled, path: file === defaultFile ? defaultLogPath : file });
         onChange();
       });
     },
     open: () => enqueue(async () => {
-      const file = settings.value.path;
+      const file = selectedFile();
       const current = await read(file);
-      if (!current.exists) await write(file, [], false);
+      if (!current.entries.length) return;
       if (await shell.openPath(file)) throw error("error.logOpen");
       onChange();
     }),
@@ -1273,7 +1376,7 @@ function createLoginLog(ctx, { onChange }) {
       timer = undefined;
       pending = [];
       return enqueue(async () => {
-        const file = settings.value.path;
+        const file = selectedFile();
         const current = await read(file);
         if (current.exists) await write(file, [], true);
         onChange();
@@ -1285,7 +1388,7 @@ function createLoginLog(ctx, { onChange }) {
       const entry = normalize(event);
       if (!entry) return;
       if (pending.length === BATCH_LIMIT) pending.shift();
-      pending.push({ file: current.path, event: entry });
+      pending.push({ file: selectedFile(), event: entry });
       if (!timer) {
         timer = setTimeout(() => {
           void flush().catch(() => ctx.log.write("warn", "Remote access login log write failed"));
@@ -1297,227 +1400,6 @@ function createLoginLog(ctx, { onChange }) {
 }
 
 module.exports = { createLoginLog };
-  };
-  factories["./i18n.cjs"] = function (require, module, exports) {
-const en = {
-  title: "Remote Access",
-  description: "Manage remote listening, sign-in credentials, and live connections.",
-  configuration: "Configuration",
-  allowedSources: "Source IP allowlist",
-  allowedSourcesHelp: "Enter IP addresses or CIDR ranges separated by commas or spaces. Leave blank to allow any source.",
-  blocked: "Blocked",
-  methodBlocked: "IP allowlist",
-  "error.allowlist": "Enter valid IP addresses or CIDR ranges.",
-  listenAddress: "Listen address",
-  listenAddressHelp: "Choose an IP address assigned to this computer and an available port.",
-  listenAddressHint: "OpenCode Desktop uses port {{port}}. Choose a different port for remote access.",
-  listenAddressConflict: "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
-  ipAddress: "IP address",
-  localIp: "Local IP",
-  port: "Port",
-  credentials: "Sign-in credentials",
-  credentialsHelp: "Save for the next start, or save and restart the listener to apply changes now.",
-  username: "Username",
-  password: "Password",
-  revealPassword: "Show password",
-  hidePassword: "Hide password",
-  save: "Save",
-  saveRestart: "Save and restart",
-  saveSuccess: "Settings saved.",
-  restartSuccess: "Listener restarted with the saved settings.",
-  pending: "Saved changes will apply the next time the listener starts.",
-  listener: "Listener",
-  listenerStatus: "Listener status",
-  restarting: "Restarting…",
-  listening: "Listening",
-  stopped: "Stopped",
-  listenerHelp: "Start the listener to connect from another device that can reach this address.",
-  start: "Start listener",
-  stop: "Stop listener",
-  openBrowser: "Open in browser",
-  generateQr: "Generate pairing QR code",
-  cameraQr: "Camera",
-  appQr: "OpenCode App",
-  pairingHint: "Scan with the OpenCode app or your camera, or open the one-time link in a browser. It expires in 5 minutes.",
-  pairingCountdown: "Expires in {{time}}",
-  pairingExpired: "Pairing link expired",
-  pairingExpiredHint: "Generate a new QR code to pair.",
-  connections: "Current connections",
-  noConnections: "No active connections",
-  noConnectionsHelp: "Connected devices appear here by source IP.",
-  thisComputer: "This computer",
-  unknownDevice: "Unknown device",
-  connectionCount: "{{count}} connections",
-  connectionCountOne: "1 connection",
-  deviceAliases: "Device aliases",
-  noAliases: "No device aliases",
-  noAliasesHelp: "Add an alias from a current connection or sign-in log entry.",
-  setAlias: "Set alias",
-  editAlias: "Edit alias",
-  removeAlias: "Remove alias",
-  aliasLabel: "Alias",
-  signInLogs: "Sign-in log",
-  noLogs: "No sign-in attempts recorded",
-  clearLogs: "Clear log",
-  clearLogsConfirm: "Clear sign-in log?",
-  clearLogsDescription: "This removes the recorded sign-in attempts for this installation.",
-  clear: "Clear",
-  cancel: "Cancel",
-  showMore: "Show more",
-  success: "Success",
-  rejected: "Rejected",
-  methodBasic: "Password",
-  methodPair: "Pairing",
-  viewLogs: "View log",
-  hideLogs: "Hide log",
-  logRecording: "Record sign-ins",
-  logRecordingHelp: "Record successful and rejected sign-ins in the local log file.",
-  logPath: "Log file",
-  fileSize: "File size: {{size}}",
-  applyLogPath: "Save log path",
-  openLogFile: "Open log file",
-  "error.aliasSaveFailed": "Could not save the device alias.",
-  "error.startFailed": "Could not start the remote listener.",
-  "error.browserFailed": "Could not open the browser.",
-  "error.logPath": "Enter an absolute file path.",
-  "error.logFile": "Choose a new file or an existing OpenCode Remote Access log.",
-  "error.logTooLarge": "The log exceeds 1 MiB. Choose another log file.",
-  "error.logOpen": "Could not open the log file.",
-  "error.logSave": "Could not save the log.",
-  dateLocale: "en",
-  "error.invalidIp": "Enter a specific IPv4 address to listen on.",
-  "error.invalidPort": "Enter a whole-number port between 1 and 65535.",
-  "error.invalidUsername": "Enter a username without colons or control characters.",
-  "error.invalidPassword": "Enter a password without control characters.",
-  "error.credentialsTooLong": "Usernames can be up to 256 bytes and passwords up to 1024 bytes.",
-  "error.pluginClosing": "The remote access plugin is shutting down.",
-  "error.configRead": "Could not read remote.json. Check the file or save the settings again.",
-  "error.portConflict": "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
-  "error.sidecarNotReady": "The local OpenCode service is not ready.",
-  "error.ipNotAssigned": "This IP address is not assigned to the computer. Check your network or VPN.",
-  "error.portInUse": "Port {{port}} is already in use. Choose a different port.",
-  "error.ipUnavailable": "The listen address is unavailable. Check your network or VPN.",
-  "error.portPermission": "Permission denied for port {{port}}.",
-  "error.restoreFailed": "The previous listener could not be restored. Check the address and port, then start it again.",
-  "error.listenerStopped": "Start the remote listener first.",
-  "error.pairFailed": "Could not generate a pairing code. Check the local OpenCode service.",
-  "error.pairAddressMismatch": "The pairing link did not match the active listener.",
-  "error.invalidDeviceId": "The device identifier is invalid.",
-  "error.invalidDeviceAlias": "Enter a shorter alias without control characters.",
-  "error.aliasLimit": "Remove an existing device alias before adding another.",
-  "error.saveFailed": "Could not save remote access settings.",
-};
-
-const zh = {
-  title: "远程访问",
-  description: "管理远程监听、登录凭据与实时连接。",
-  configuration: "配置",
-  allowedSources: "来源 IP 白名单",
-  allowedSourcesHelp: "支持单个 IP 和 CIDR 网段，用逗号或空格分隔。留空允许任意来源。",
-  blocked: "被拦截",
-  methodBlocked: "IP 白名单",
-  "error.allowlist": "请输入有效的 IP 地址或 CIDR 网段。",
-  listenAddress: "监听地址",
-  listenAddressHelp: "填写本机网络接口的 IP 地址和可用端口。",
-  listenAddressHint: "桌面服务使用端口 {{port}}，请为远程入口选择其他端口。",
-  listenAddressConflict: "端口 {{port}} 已由桌面服务使用，请换一个端口。",
-  ipAddress: "IP 地址",
-  localIp: "本机 IP",
-  port: "端口",
-  credentials: "登录凭据",
-  credentialsHelp: "保存后在下次启动时生效，也可以保存并重启监听立即应用。",
-  username: "账号",
-  password: "密码",
-  revealPassword: "显示密码",
-  hidePassword: "隐藏密码",
-  save: "保存",
-  saveRestart: "保存并重启",
-  saveSuccess: "设置已保存。",
-  restartSuccess: "监听已使用保存的设置重新启动。",
-  pending: "已保存的改动将在下次启动监听时生效。",
-  listener: "监听",
-  listenerStatus: "监听状态",
-  restarting: "重启中…",
-  listening: "正在监听",
-  stopped: "未监听",
-  listenerHelp: "启动后可从能访问此地址的设备连接。",
-  start: "启动监听",
-  stop: "停止监听",
-  openBrowser: "在浏览器中打开",
-  generateQr: "生成配对二维码",
-  cameraQr: "相机",
-  appQr: "OpenCode App",
-  pairingHint: "用 OpenCode App 或相机扫码，或在浏览器打开一次性链接。有效期 5 分钟。",
-  pairingCountdown: "剩余 {{time}}",
-  pairingExpired: "配对链接已过期",
-  pairingExpiredHint: "请生成新的二维码进行配对。",
-  connections: "当前连接",
-  noConnections: "暂无连接",
-  noConnectionsHelp: "连接建立后会按来源 IP 显示在这里。",
-  thisComputer: "本机",
-  unknownDevice: "未知设备",
-  connectionCount: "{{count}} 个连接",
-  connectionCountOne: "1 个连接",
-  deviceAliases: "设备别名",
-  noAliases: "暂无设备别名",
-  noAliasesHelp: "可从当前连接或登录日志为设备添加别名。",
-  setAlias: "设置别名",
-  editAlias: "编辑别名",
-  removeAlias: "删除别名",
-  aliasLabel: "别名",
-  signInLogs: "登录日志",
-  noLogs: "暂无登录记录",
-  clearLogs: "清空日志",
-  clearLogsConfirm: "清空登录日志？",
-  clearLogsDescription: "将删除此插件记录的登录尝试。",
-  clear: "清空",
-  cancel: "取消",
-  showMore: "查看更多",
-  success: "成功",
-  rejected: "拒绝",
-  methodBasic: "密码",
-  methodPair: "配对",
-  viewLogs: "查看日志",
-  hideLogs: "收起日志",
-  logRecording: "记录登录日志",
-  logRecordingHelp: "将成功和被拒绝的登录记录写入本地日志文件。",
-  logPath: "日志文件",
-  fileSize: "文件大小 {{size}}",
-  applyLogPath: "保存日志路径",
-  openLogFile: "打开日志文件",
-  "error.aliasSaveFailed": "无法保存设备别名。",
-  "error.startFailed": "无法启动远程监听。",
-  "error.browserFailed": "无法打开浏览器。",
-  "error.logPath": "请输入绝对文件路径。",
-  "error.logFile": "请选择一个新文件或已有的 OpenCode 远程访问日志。",
-  "error.logTooLarge": "日志超过 1 MiB，请选择另一个日志文件。",
-  "error.logOpen": "无法打开日志文件。",
-  "error.logSave": "无法保存日志。",
-  dateLocale: "zh-CN",
-  "error.invalidIp": "请输入要监听的具体 IPv4 地址。",
-  "error.invalidPort": "请输入 1 至 65535 之间的整数端口。",
-  "error.invalidUsername": "账号不能为空，且不能包含冒号或控制字符。",
-  "error.invalidPassword": "密码不能为空，且不能包含控制字符。",
-  "error.credentialsTooLong": "账号和密码分别不能超过 256 字节和 1024 字节。",
-  "error.pluginClosing": "远程访问插件正在关闭。",
-  "error.configRead": "无法读取 remote.json，请检查文件或重新保存设置。",
-  "error.portConflict": "端口 {{port}} 已由桌面服务使用，请换一个端口。",
-  "error.sidecarNotReady": "OpenCode 本机服务尚未就绪。",
-  "error.ipNotAssigned": "该 IP 地址没有分配给本机，请检查网络或 VPN。",
-  "error.portInUse": "端口 {{port}} 已被占用，请选择其他端口。",
-  "error.ipUnavailable": "监听地址不可用，请检查网络或 VPN。",
-  "error.portPermission": "没有权限监听端口 {{port}}。",
-  "error.restoreFailed": "无法恢复原监听，请检查地址与端口后重新启动监听。",
-  "error.listenerStopped": "请先启动远程监听。",
-  "error.pairFailed": "无法生成配对码，请检查 OpenCode 本机服务。",
-  "error.pairAddressMismatch": "配对链接与当前监听地址不一致。",
-  "error.invalidDeviceId": "设备标识无效。",
-  "error.invalidDeviceAlias": "请输入较短且不包含控制字符的别名。",
-  "error.aliasLimit": "请先删除一个已有的设备别名。",
-  "error.saveFailed": "无法保存远程访问设置。",
-};
-
-module.exports = { i18n: { en, "zh-Hans": zh } };
   };
   factories["./pairing.cjs"] = function (require, module, exports) {
 const { createComponent, createSignal, onCleanup } = require("solid-js");
@@ -3954,6 +3836,688 @@ function sourceFilter(value) {
 
 module.exports = { sourceFilter };
   };
+  factories["./tls.cjs"] = function (require, module, exports) {
+const { execFile } = require("node:child_process");
+const { createHash, X509Certificate } = require("node:crypto");
+const { constants } = require("node:fs");
+const fs = require("node:fs/promises");
+const { isIP } = require("node:net");
+const path = require("node:path");
+const { createSecureContext } = require("node:tls");
+const { domainToASCII } = require("node:url");
+const { promisify } = require("node:util");
+
+const limit = 1024 * 1024;
+const minVersion = "TLSv1.2";
+const defaultHttps = Object.freeze({ enabled: false, hostname: "", certificatePath: "", keyPath: "" });
+
+function validateHttps(input = defaultHttps, problem) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw problem("error.httpsSettings");
+  const { enabled, certificatePath, keyPath, hostname } = { ...defaultHttps, ...input };
+  if (typeof enabled !== "boolean" || [certificatePath, keyPath, hostname].some((value) => typeof value !== "string")) {
+    throw problem("error.httpsSettings");
+  }
+
+  const rawHostname = hostname.trim();
+  let name = "";
+  if (rawHostname) {
+    if (/[\s/\\:?#@%]/u.test(rawHostname)) throw problem("error.httpsHostname");
+    name = domainToASCII(rawHostname).toLowerCase().replace(/\.$/u, "");
+    const validLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+    if (!name || name.length > 253 || isIP(name) || !name.split(".").every((label) => validLabel.test(label))) {
+      throw problem("error.httpsHostname");
+    }
+  }
+
+  const cert = certificatePath.trim();
+  const key = keyPath.trim();
+  if (Boolean(cert) !== Boolean(key)) throw problem("error.httpsPathPair");
+  if ([cert, key].some((file) => file && (!path.isAbsolute(file) || file.includes("\0")))) {
+    throw problem("error.httpsAbsolutePaths");
+  }
+  return { enabled, hostname: name, certificatePath: cert, keyPath: key };
+}
+
+async function readPem(file) {
+  const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || !stat.size || stat.size > limit) throw new Error("Invalid PEM file");
+    const contents = await handle.readFile();
+    if (contents.length > limit) throw new Error("PEM file exceeds size limit");
+    return contents;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readMaterial(certificatePath, keyPath, host, problem) {
+  let cert, key, certificate;
+  try {
+    [cert, key] = await Promise.all([readPem(certificatePath), readPem(keyPath)]);
+  } catch {
+    throw problem("error.httpsRead");
+  }
+  try {
+    certificate = new X509Certificate(cert);
+    createSecureContext({ cert, key, minVersion });
+  } catch {
+    throw problem("error.httpsInvalidPem");
+  }
+  const now = Date.now();
+  if (Date.parse(certificate.validFrom) > now || Date.parse(certificate.validTo) <= now) {
+    throw problem("error.httpsValidity");
+  }
+  if (host && !(isIP(host) ? certificate.checkIP(host) : certificate.checkHost(host, { subject: "never" }))) {
+    throw problem("error.httpsCertificateHost", { host });
+  }
+  return { cert, key, minVersion };
+}
+
+async function generatedMaterial(directory, host, problem, signal) {
+  const identity = createHash("sha256").update(host).digest("hex").slice(0, 24);
+  const cache = path.join(directory, identity);
+  const certificatePath = path.join(cache, "certificate.pem");
+  const keyPath = path.join(cache, "private-key.pem");
+  try {
+    const material = await readMaterial(certificatePath, keyPath, host, problem);
+    return { ...material, generatedCertificatePath: certificatePath };
+  } catch {
+    // A different identity has its own cache. Regenerate a missing or invalid pair for this one.
+  }
+
+  let temporary;
+  try {
+    await fs.mkdir(cache, { recursive: true, mode: 0o700 });
+    temporary = await fs.mkdtemp(path.join(cache, ".pending-"));
+    const config = path.join(temporary, "request.cnf");
+    const cert = path.join(temporary, "certificate.pem");
+    const key = path.join(temporary, "private-key.pem");
+    await fs.writeFile(config, [
+      "[req]",
+      "prompt = no",
+      "distinguished_name = dn",
+      "x509_extensions = server",
+      "[dn]",
+      "CN = OpenCode Remote Access",
+      "[server]",
+      "basicConstraints = critical,CA:FALSE",
+      "keyUsage = critical,digitalSignature,keyEncipherment",
+      "extendedKeyUsage = serverAuth",
+      `subjectAltName = ${isIP(host) ? "IP" : "DNS"}:${host}`,
+      "",
+    ].join("\n"), { flag: "wx", mode: 0o600 });
+    await promisify(execFile)("openssl", [
+      "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "365", "-nodes",
+      "-config", config, "-out", cert, "-keyout", key,
+    ], { signal, timeout: 20_000, windowsHide: true });
+    await fs.chmod(key, 0o600);
+    await fs.chmod(cert, 0o600);
+    const material = await readMaterial(cert, key, host, problem);
+    await fs.rename(key, keyPath);
+    await fs.rename(cert, certificatePath);
+    return { ...material, generatedCertificatePath: certificatePath };
+  } catch (failure) {
+    if (failure.code === "ENOENT" && failure.syscall?.startsWith("spawn")) throw problem("error.httpsOpenSsl");
+    throw problem("error.httpsGenerate");
+  } finally {
+    if (temporary) await fs.rm(temporary, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function listenerTls(settings, host, directory, problem, signal) {
+  if (!settings.enabled) return undefined;
+  const name = settings.hostname || host;
+  if (settings.certificatePath) {
+    return { ...await readMaterial(settings.certificatePath, settings.keyPath, name, problem), hostname: settings.hostname };
+  }
+  return { ...await generatedMaterial(directory, name, problem, signal), hostname: settings.hostname };
+}
+
+module.exports = { defaultHttps, validateHttps, listenerTls };
+  };
+  factories["./i18n.cjs"] = function (require, module, exports) {
+module.exports = {
+  i18n: {
+    en: require("./i18n/en.cjs"),
+    zh: require("./i18n/zh.cjs"),
+    zht: require("./i18n/zht.cjs"),
+    ru: require("./i18n/ru.cjs"),
+  },
+};
+  };
+  factories["./i18n/en.cjs"] = function (require, module, exports) {
+module.exports = {
+  "operationFailed": "Remote access error",
+  "title": "Remote Access",
+  "description": "Manage remote listening, sign-in credentials, and live connections.",
+  "configuration": "Configuration",
+  "allowedSources": "Source IP allowlist",
+  "allowedSourcesHelp": "Enter IP addresses or CIDR ranges separated by commas or spaces. Leave blank to allow any source.",
+  "blocked": "Blocked",
+  "methodBlocked": "IP allowlist",
+  "error.allowlist": "Enter valid IP addresses or CIDR ranges.",
+  "listenAddress": "Listen address",
+  "listenAddressHelp": "Choose an IP address assigned to this computer and an available port.",
+  "listenAddressHint": "OpenCode Desktop uses port {{port}}. Choose a different port for remote access.",
+  "listenAddressConflict": "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
+  "ipAddress": "IP address",
+  "localIp": "Local IP",
+  "port": "Port",
+  "credentials": "Sign-in credentials",
+  "credentialsHelp": "Save for the next start, or save and restart the listener to apply changes now.",
+  "username": "Username",
+  "password": "Password",
+  "revealPassword": "Show password",
+  "hidePassword": "Hide password",
+  "save": "Save",
+  "saveRestart": "Save and restart",
+  "saveSuccess": "Settings saved.",
+  "restartSuccess": "Listener restarted with the saved settings.",
+  "pending": "Saved changes will apply the next time the listener starts.",
+  "listener": "Listener",
+  "listenerStatus": "Listener status",
+  "restarting": "Restarting…",
+  "listening": "Listening",
+  "stopped": "Stopped",
+  "listenerHelp": "Start the listener to connect from another device that can reach this address.",
+  "start": "Start listener",
+  "stop": "Stop listener",
+  "openBrowser": "Open in browser",
+  "generateQr": "Generate pairing QR code",
+  "cameraQr": "Camera",
+  "appQr": "OpenCode App",
+  "pairingHint": "Scan with the OpenCode app or your camera, or open the one-time link in a browser. It expires in 5 minutes.",
+  "pairingCountdown": "Expires in {{time}}",
+  "pairingExpired": "Pairing link expired",
+  "pairingExpiredHint": "Generate a new QR code to pair.",
+  "connections": "Current connections",
+  "noConnections": "No active connections",
+  "noConnectionsHelp": "Connected devices appear here by source IP.",
+  "thisComputer": "This computer",
+  "unknownDevice": "Unknown device",
+  "connectionCount": "{{count}} connections",
+  "connectionCountOne": "1 connection",
+  "deviceAliases": "Device aliases",
+  "noAliases": "No device aliases",
+  "noAliasesHelp": "Add an alias from a current connection or sign-in log entry.",
+  "setAlias": "Set alias",
+  "editAlias": "Edit alias",
+  "removeAlias": "Remove alias",
+  "aliasLabel": "Alias",
+  "signInLogs": "Sign-in log",
+  "noLogs": "No sign-in attempts recorded",
+  "clearLogs": "Clear log",
+  "clearLogsConfirm": "Clear sign-in log?",
+  "clearLogsDescription": "This removes the recorded sign-in attempts for this installation.",
+  "clear": "Clear",
+  "cancel": "Cancel",
+  "showMore": "Show more",
+  "success": "Success",
+  "rejected": "Rejected",
+  "methodBasic": "Password",
+  "methodPair": "Pairing",
+  "viewLogs": "View log",
+  "hideLogs": "Hide log",
+  "logRecording": "Record sign-ins",
+  "logRecordingHelp": "Record successful and rejected sign-ins in the local log file.",
+  "logPath": "Log file",
+  "fileSize": "File size: {{size}}",
+  "applyLogPath": "Save log path",
+  "openLogFile": "Open log file",
+  "error.aliasSaveFailed": "Could not save the device alias.",
+  "error.startFailed": "Could not start the remote listener.",
+  "error.browserFailed": "Could not open the browser.",
+  "error.logPath": "Enter an absolute file path.",
+  "error.logFile": "Choose a new file or an existing OpenCode Remote Access log.",
+  "error.logTooLarge": "The log exceeds 1 MiB. Choose another log file.",
+  "error.logOpen": "Could not open the log file.",
+  "error.logSave": "Could not save the log.",
+  "dateLocale": "en",
+  "error.invalidIp": "Enter a specific IPv4 address to listen on.",
+  "error.invalidPort": "Enter a whole-number port between 1 and 65535.",
+  "error.invalidUsername": "Enter a username without colons or control characters.",
+  "error.invalidPassword": "Enter a password without control characters.",
+  "error.credentialsTooLong": "Usernames can be up to 256 bytes and passwords up to 1024 bytes.",
+  "error.pluginClosing": "The remote access plugin is shutting down.",
+  "error.configRead": "Could not read remote.json. Check the file or save the settings again.",
+  "error.portConflict": "Port {{port}} is used by OpenCode Desktop. Choose a different port.",
+  "error.sidecarNotReady": "The local OpenCode service is not ready.",
+  "error.ipNotAssigned": "This IP address is not assigned to the computer. Check your network or VPN.",
+  "error.portInUse": "Port {{port}} is already in use. Choose a different port.",
+  "error.ipUnavailable": "The listen address is unavailable. Check your network or VPN.",
+  "error.portPermission": "Permission denied for port {{port}}.",
+  "error.restoreFailed": "The previous listener could not be restored. Check the address and port, then start it again.",
+  "error.listenerStopped": "Start the remote listener first.",
+  "error.pairFailed": "Could not generate a pairing code. Check the local OpenCode service.",
+  "error.pairAddressMismatch": "The pairing link did not match the active listener.",
+  "error.invalidDeviceId": "The device identifier is invalid.",
+  "error.invalidDeviceAlias": "Enter a shorter alias without control characters.",
+  "error.aliasLimit": "Remove an existing device alias before adding another.",
+  "error.saveFailed": "Could not save remote access settings.",
+  "httpsListener": "HTTPS",
+  "httpsHelp": "Encrypt browser and app connections to the remote listener.",
+  "httpsCertificateSettings": "Certificate settings",
+  "httpsCertificateHelp": "Leave both paths blank to generate a self-signed certificate.",
+  "httpsHostname": "Access hostname",
+  "httpsHostnamePlaceholder": "Use the listening IP if empty",
+  "httpsCertificatePath": "PEM certificate path",
+  "httpsKeyPath": "PEM private key path",
+  "httpsChooseFile": "Choose file",
+  "httpsAllFiles": "All files",
+  "httpsSelfSigned": "Trust this self-signed certificate on the connecting device",
+  "error.httpsSettings": "The HTTPS settings are invalid.",
+  "error.httpsHostname": "Enter a hostname without a scheme, port, or path.",
+  "error.httpsPathPair": "Provide both the certificate and private key, or leave both blank.",
+  "error.httpsAbsolutePaths": "Use absolute paths for the certificate and private key.",
+  "error.httpsRead": "Could not read the certificate or private key.",
+  "error.httpsInvalidPem": "Choose a valid PEM certificate and matching unencrypted PEM private key.",
+  "error.httpsValidity": "The certificate is expired or not yet valid.",
+  "error.httpsCertificateHost": "The certificate does not cover {{host}}. Use a matching certificate or set its hostname.",
+  "error.httpsOpenSsl": "Couldn't find OpenSSL. Install it or choose a certificate and private key.",
+  "error.httpsGenerate": "Could not generate the self-signed certificate.",
+  "error.httpsFilePicker": "Could not open the file picker."
+};
+  };
+  factories["./i18n/zh.cjs"] = function (require, module, exports) {
+module.exports = {
+  "operationFailed": "远程访问出错",
+  "title": "远程访问",
+  "description": "管理远程监听、登录凭据与实时连接。",
+  "configuration": "配置",
+  "allowedSources": "来源 IP 白名单",
+  "allowedSourcesHelp": "支持单个 IP 和 CIDR 网段，用逗号或空格分隔。留空允许任意来源。",
+  "blocked": "被拦截",
+  "methodBlocked": "IP 白名单",
+  "error.allowlist": "请输入有效的 IP 地址或 CIDR 网段。",
+  "listenAddress": "监听地址",
+  "listenAddressHelp": "填写本机网络接口的 IP 地址和可用端口。",
+  "listenAddressHint": "桌面服务使用端口 {{port}}，请为远程入口选择其他端口。",
+  "listenAddressConflict": "端口 {{port}} 已由桌面服务使用，请换一个端口。",
+  "ipAddress": "IP 地址",
+  "localIp": "本机 IP",
+  "port": "端口",
+  "credentials": "登录凭据",
+  "credentialsHelp": "保存后在下次启动时生效，也可以保存并重启监听立即应用。",
+  "username": "账号",
+  "password": "密码",
+  "revealPassword": "显示密码",
+  "hidePassword": "隐藏密码",
+  "save": "保存",
+  "saveRestart": "保存并重启",
+  "saveSuccess": "设置已保存。",
+  "restartSuccess": "监听已使用保存的设置重新启动。",
+  "pending": "已保存的改动将在下次启动监听时生效。",
+  "listener": "监听",
+  "listenerStatus": "监听状态",
+  "restarting": "重启中…",
+  "listening": "正在监听",
+  "stopped": "未监听",
+  "listenerHelp": "启动后可从能访问此地址的设备连接。",
+  "start": "启动监听",
+  "stop": "停止监听",
+  "openBrowser": "在浏览器中打开",
+  "generateQr": "生成配对二维码",
+  "cameraQr": "相机",
+  "appQr": "OpenCode App",
+  "pairingHint": "用 OpenCode App 或相机扫码，或在浏览器打开一次性链接。有效期 5 分钟。",
+  "pairingCountdown": "剩余 {{time}}",
+  "pairingExpired": "配对链接已过期",
+  "pairingExpiredHint": "请生成新的二维码进行配对。",
+  "connections": "当前连接",
+  "noConnections": "暂无连接",
+  "noConnectionsHelp": "连接建立后会按来源 IP 显示在这里。",
+  "thisComputer": "本机",
+  "unknownDevice": "未知设备",
+  "connectionCount": "{{count}} 个连接",
+  "connectionCountOne": "1 个连接",
+  "deviceAliases": "设备别名",
+  "noAliases": "暂无设备别名",
+  "noAliasesHelp": "可从当前连接或登录日志为设备添加别名。",
+  "setAlias": "设置别名",
+  "editAlias": "编辑别名",
+  "removeAlias": "删除别名",
+  "aliasLabel": "别名",
+  "signInLogs": "登录日志",
+  "noLogs": "暂无登录记录",
+  "clearLogs": "清空日志",
+  "clearLogsConfirm": "清空登录日志？",
+  "clearLogsDescription": "将删除此插件记录的登录尝试。",
+  "clear": "清空",
+  "cancel": "取消",
+  "showMore": "查看更多",
+  "success": "成功",
+  "rejected": "拒绝",
+  "methodBasic": "密码",
+  "methodPair": "配对",
+  "viewLogs": "查看日志",
+  "hideLogs": "收起日志",
+  "logRecording": "记录登录日志",
+  "logRecordingHelp": "将成功和被拒绝的登录记录写入本地日志文件。",
+  "logPath": "日志文件",
+  "fileSize": "文件大小 {{size}}",
+  "applyLogPath": "保存日志路径",
+  "openLogFile": "打开日志文件",
+  "error.aliasSaveFailed": "无法保存设备别名。",
+  "error.startFailed": "无法启动远程监听。",
+  "error.browserFailed": "无法打开浏览器。",
+  "error.logPath": "请输入绝对文件路径。",
+  "error.logFile": "请选择一个新文件或已有的 OpenCode 远程访问日志。",
+  "error.logTooLarge": "日志超过 1 MiB，请选择另一个日志文件。",
+  "error.logOpen": "无法打开日志文件。",
+  "error.logSave": "无法保存日志。",
+  "dateLocale": "zh-CN",
+  "error.invalidIp": "请输入要监听的具体 IPv4 地址。",
+  "error.invalidPort": "请输入 1 至 65535 之间的整数端口。",
+  "error.invalidUsername": "账号不能为空，且不能包含冒号或控制字符。",
+  "error.invalidPassword": "密码不能为空，且不能包含控制字符。",
+  "error.credentialsTooLong": "账号和密码分别不能超过 256 字节和 1024 字节。",
+  "error.pluginClosing": "远程访问插件正在关闭。",
+  "error.configRead": "无法读取 remote.json，请检查文件或重新保存设置。",
+  "error.portConflict": "端口 {{port}} 已由桌面服务使用，请换一个端口。",
+  "error.sidecarNotReady": "OpenCode 本机服务尚未就绪。",
+  "error.ipNotAssigned": "该 IP 地址没有分配给本机，请检查网络或 VPN。",
+  "error.portInUse": "端口 {{port}} 已被占用，请选择其他端口。",
+  "error.ipUnavailable": "监听地址不可用，请检查网络或 VPN。",
+  "error.portPermission": "没有权限监听端口 {{port}}。",
+  "error.restoreFailed": "无法恢复原监听，请检查地址与端口后重新启动监听。",
+  "error.listenerStopped": "请先启动远程监听。",
+  "error.pairFailed": "无法生成配对码，请检查 OpenCode 本机服务。",
+  "error.pairAddressMismatch": "配对链接与当前监听地址不一致。",
+  "error.invalidDeviceId": "设备标识无效。",
+  "error.invalidDeviceAlias": "请输入较短且不包含控制字符的别名。",
+  "error.aliasLimit": "请先删除一个已有的设备别名。",
+  "error.saveFailed": "无法保存远程访问设置。",
+  "httpsListener": "HTTPS",
+  "httpsHelp": "加密浏览器和 App 到远程入口的连接。",
+  "httpsCertificateSettings": "证书设置",
+  "httpsCertificateHelp": "证书和私钥两项留空时，插件会生成自签名证书。",
+  "httpsHostname": "访问域名",
+  "httpsHostnamePlaceholder": "留空使用监听 IP",
+  "httpsCertificatePath": "PEM 证书路径",
+  "httpsKeyPath": "PEM 私钥路径",
+  "httpsChooseFile": "选择文件",
+  "httpsAllFiles": "所有文件",
+  "httpsSelfSigned": "连接前请在客户端信任这份自签名证书",
+  "error.httpsSettings": "HTTPS 设置无效。",
+  "error.httpsHostname": "请输入域名，省略协议、端口和路径。",
+  "error.httpsPathPair": "证书和私钥需要同时填写，也可以两项留空。",
+  "error.httpsAbsolutePaths": "证书和私钥需要使用绝对路径。",
+  "error.httpsRead": "无法读取证书或私钥。",
+  "error.httpsInvalidPem": "请选择有效的 PEM 证书和与其匹配的未加密 PEM 私钥。",
+  "error.httpsValidity": "证书已过期或尚未生效。",
+  "error.httpsCertificateHost": "证书未覆盖 {{host}}。请使用匹配的证书或填写证书覆盖的域名。",
+  "error.httpsOpenSsl": "找不到 OpenSSL。请安装 OpenSSL，或选择已有的证书和私钥。",
+  "error.httpsGenerate": "无法生成自签名证书。",
+  "error.httpsFilePicker": "无法打开文件选择器。"
+};
+  };
+  factories["./i18n/zht.cjs"] = function (require, module, exports) {
+module.exports = {
+  "operationFailed": "遠端存取發生錯誤",
+  "title": "遠端存取",
+  "description": "管理遠端監聽、登入憑證與即時連線。",
+  "configuration": "設定",
+  "allowedSources": "來源 IP 允許清單",
+  "allowedSourcesHelp": "可填單一 IP 與 CIDR 網段，以逗號或空格分隔。留空允許任何來源。",
+  "blocked": "已封鎖",
+  "methodBlocked": "IP 允許清單",
+  "error.allowlist": "請輸入有效的 IP 位址或 CIDR 網段。",
+  "listenAddress": "監聽位址",
+  "listenAddressHelp": "輸入本機網路介面的 IP 位址和可用連接埠。",
+  "listenAddressHint": "桌面服務使用連接埠 {{port}}，請為遠端入口選用其他連接埠。",
+  "listenAddressConflict": "桌面服務已使用連接埠 {{port}}，請選用其他連接埠。",
+  "ipAddress": "IP 位址",
+  "localIp": "本機 IP",
+  "port": "連接埠",
+  "credentials": "登入憑證",
+  "credentialsHelp": "儲存後在下次啟動時套用，也可儲存並重新啟動監聽以立即套用。",
+  "username": "帳號",
+  "password": "密碼",
+  "revealPassword": "顯示密碼",
+  "hidePassword": "隱藏密碼",
+  "save": "儲存",
+  "saveRestart": "儲存並重新啟動",
+  "saveSuccess": "設定已儲存。",
+  "restartSuccess": "已使用儲存的設定重新啟動監聽。",
+  "pending": "已儲存的變更將於下次啟動監聽時套用。",
+  "listener": "監聽",
+  "listenerStatus": "監聽狀態",
+  "restarting": "正在重新啟動…",
+  "listening": "正在監聽",
+  "stopped": "已停止",
+  "listenerHelp": "啟動後，可從能存取此位址的其他裝置連線。",
+  "start": "啟動監聽",
+  "stop": "停止監聽",
+  "openBrowser": "在瀏覽器中開啟",
+  "generateQr": "產生配對 QR Code",
+  "cameraQr": "相機",
+  "appQr": "OpenCode App",
+  "pairingHint": "用 OpenCode App 或相機掃描，或在瀏覽器開啟一次性連結。有效期限為 5 分鐘。",
+  "pairingCountdown": "剩餘 {{time}}",
+  "pairingExpired": "配對連結已過期",
+  "pairingExpiredHint": "請產生新的 QR Code 進行配對。",
+  "connections": "目前連線",
+  "noConnections": "目前沒有連線",
+  "noConnectionsHelp": "連線建立後會依來源 IP 顯示在此。",
+  "thisComputer": "本機",
+  "unknownDevice": "未知裝置",
+  "connectionCount": "{{count}} 個連線",
+  "connectionCountOne": "1 個連線",
+  "deviceAliases": "裝置別名",
+  "noAliases": "目前沒有裝置別名",
+  "noAliasesHelp": "可從目前連線或登入記錄為裝置新增別名。",
+  "setAlias": "設定別名",
+  "editAlias": "編輯別名",
+  "removeAlias": "移除別名",
+  "aliasLabel": "別名",
+  "signInLogs": "登入記錄",
+  "noLogs": "目前沒有登入記錄",
+  "clearLogs": "清除記錄",
+  "clearLogsConfirm": "清除登入記錄？",
+  "clearLogsDescription": "這會刪除此安裝已記錄的登入嘗試。",
+  "clear": "清除",
+  "cancel": "取消",
+  "showMore": "顯示更多",
+  "success": "成功",
+  "rejected": "已拒絕",
+  "methodBasic": "密碼",
+  "methodPair": "配對",
+  "viewLogs": "查看記錄",
+  "hideLogs": "收合記錄",
+  "logRecording": "記錄登入",
+  "logRecordingHelp": "將成功和遭拒絕的登入嘗試寫入本機記錄檔。",
+  "logPath": "記錄檔",
+  "fileSize": "檔案大小 {{size}}",
+  "applyLogPath": "儲存記錄檔路徑",
+  "openLogFile": "開啟記錄檔",
+  "error.aliasSaveFailed": "無法儲存裝置別名。",
+  "error.startFailed": "無法啟動遠端監聽。",
+  "error.browserFailed": "無法開啟瀏覽器。",
+  "error.logPath": "請輸入絕對檔案路徑。",
+  "error.logFile": "請選擇新檔案或已有的 OpenCode 遠端存取記錄檔。",
+  "error.logTooLarge": "記錄檔超過 1 MiB，請選擇其他檔案。",
+  "error.logOpen": "無法開啟記錄檔。",
+  "error.logSave": "無法儲存記錄檔。",
+  "dateLocale": "zh-TW",
+  "error.invalidIp": "請輸入要監聽的特定 IPv4 位址。",
+  "error.invalidPort": "請輸入 1 至 65535 之間的整數連接埠。",
+  "error.invalidUsername": "帳號不可為空，也不可包含冒號或控制字元。",
+  "error.invalidPassword": "密碼不可為空，也不可包含控制字元。",
+  "error.credentialsTooLong": "帳號最多 256 位元組，密碼最多 1024 位元組。",
+  "error.pluginClosing": "遠端存取外掛程式正在關閉。",
+  "error.configRead": "無法讀取 remote.json，請檢查檔案或重新儲存設定。",
+  "error.portConflict": "桌面服務已使用連接埠 {{port}}，請選用其他連接埠。",
+  "error.sidecarNotReady": "OpenCode 本機服務尚未就緒。",
+  "error.ipNotAssigned": "此 IP 位址尚未分配給本機，請檢查網路或 VPN。",
+  "error.portInUse": "連接埠 {{port}} 已被占用，請選用其他連接埠。",
+  "error.ipUnavailable": "監聽位址不可用，請檢查網路或 VPN。",
+  "error.portPermission": "沒有權限監聽連接埠 {{port}}。",
+  "error.restoreFailed": "無法恢復先前的監聽，請檢查位址和連接埠後重新啟動。",
+  "error.listenerStopped": "請先啟動遠端監聽。",
+  "error.pairFailed": "無法產生配對碼，請檢查 OpenCode 本機服務。",
+  "error.pairAddressMismatch": "配對連結與目前監聽位址不符。",
+  "error.invalidDeviceId": "裝置識別碼無效。",
+  "error.invalidDeviceAlias": "請輸入較短且不包含控制字元的別名。",
+  "error.aliasLimit": "請先移除一個已有的裝置別名。",
+  "error.saveFailed": "無法儲存遠端存取設定。",
+  "httpsListener": "HTTPS",
+  "httpsHelp": "加密瀏覽器及 App 到遠端入口的連線。",
+  "httpsCertificateSettings": "憑證設定",
+  "httpsCertificateHelp": "憑證和私密金鑰兩欄留空時，外掛程式會產生自簽憑證。",
+  "httpsHostname": "存取網域名稱",
+  "httpsHostnamePlaceholder": "留空使用監聽 IP",
+  "httpsCertificatePath": "PEM 憑證路徑",
+  "httpsKeyPath": "PEM 私密金鑰路徑",
+  "httpsChooseFile": "選擇檔案",
+  "httpsAllFiles": "所有檔案",
+  "httpsSelfSigned": "連線前請在用戶端信任此自簽憑證",
+  "error.httpsSettings": "HTTPS 設定無效。",
+  "error.httpsHostname": "請輸入網域名稱，省略通訊協定、連接埠及路徑。",
+  "error.httpsPathPair": "憑證和私密金鑰須一起填寫，也可兩欄都留空。",
+  "error.httpsAbsolutePaths": "憑證和私密金鑰須使用絕對路徑。",
+  "error.httpsRead": "無法讀取憑證或私密金鑰。",
+  "error.httpsInvalidPem": "請選擇有效的 PEM 憑證及與其相符的未加密 PEM 私密金鑰。",
+  "error.httpsValidity": "憑證已過期或尚未生效。",
+  "error.httpsCertificateHost": "憑證未涵蓋 {{host}}。請使用相符的憑證，或填寫憑證涵蓋的網域名稱。",
+  "error.httpsOpenSsl": "找不到 OpenSSL。請安裝 OpenSSL，或選用已有的憑證和私密金鑰。",
+  "error.httpsGenerate": "無法產生自簽憑證。",
+  "error.httpsFilePicker": "無法開啟檔案選擇器。"
+};
+  };
+  factories["./i18n/ru.cjs"] = function (require, module, exports) {
+module.exports = {
+  "operationFailed": "Ошибка удалённого доступа",
+  "title": "Удалённый доступ",
+  "description": "Настройка удалённого сервера, учётных данных и активных подключений.",
+  "configuration": "Настройки",
+  "allowedSources": "Разрешённые IP-адреса",
+  "allowedSourcesHelp": "Укажите IP-адреса или диапазоны CIDR через запятую или пробел. Пустое поле разрешает все источники.",
+  "blocked": "Заблокировано",
+  "methodBlocked": "Список разрешённых IP",
+  "error.allowlist": "Укажите допустимые IP-адреса или диапазоны CIDR.",
+  "listenAddress": "Адрес прослушивания",
+  "listenAddressHelp": "Выберите IP-адрес этого компьютера и свободный порт.",
+  "listenAddressHint": "OpenCode Desktop использует порт {{port}}. Для удалённого доступа выберите другой порт.",
+  "listenAddressConflict": "Порт {{port}} занят OpenCode Desktop. Выберите другой порт.",
+  "ipAddress": "IP-адрес",
+  "localIp": "Локальный IP",
+  "port": "Порт",
+  "credentials": "Учётные данные",
+  "credentialsHelp": "Сохраните настройки для следующего запуска или перезапустите сервер, чтобы применить их сразу.",
+  "username": "Имя пользователя",
+  "password": "Пароль",
+  "revealPassword": "Показать пароль",
+  "hidePassword": "Скрыть пароль",
+  "save": "Сохранить",
+  "saveRestart": "Сохранить и перезапустить",
+  "saveSuccess": "Настройки сохранены.",
+  "restartSuccess": "Сервер перезапущен с сохранёнными настройками.",
+  "pending": "Сохранённые изменения вступят в силу при следующем запуске сервера.",
+  "listener": "Удалённый сервер",
+  "listenerStatus": "Состояние сервера",
+  "restarting": "Перезапуск…",
+  "listening": "Запущен",
+  "stopped": "Остановлен",
+  "listenerHelp": "Запустите сервер, чтобы подключаться с других устройств, которым доступен этот адрес.",
+  "start": "Запустить сервер",
+  "stop": "Остановить сервер",
+  "openBrowser": "Открыть в браузере",
+  "generateQr": "Создать QR-код для сопряжения",
+  "cameraQr": "Камера",
+  "appQr": "Приложение OpenCode",
+  "pairingHint": "Отсканируйте код в приложении OpenCode или камерой либо откройте одноразовую ссылку в браузере. Она действует 5 минут.",
+  "pairingCountdown": "Осталось {{time}}",
+  "pairingExpired": "Ссылка для сопряжения истекла",
+  "pairingExpiredHint": "Создайте новый QR-код для сопряжения.",
+  "connections": "Текущие подключения",
+  "noConnections": "Нет активных подключений",
+  "noConnectionsHelp": "Устройства появятся здесь с IP-адресом источника.",
+  "thisComputer": "Этот компьютер",
+  "unknownDevice": "Неизвестное устройство",
+  "connectionCount": "Подключений — {{count}}",
+  "connectionCountOne": "1 подключение",
+  "deviceAliases": "Имена устройств",
+  "noAliases": "Нет сохранённых имён устройств",
+  "noAliasesHelp": "Задайте имя устройства в списке текущих подключений или в журнале входа.",
+  "setAlias": "Задать имя",
+  "editAlias": "Изменить имя",
+  "removeAlias": "Удалить имя",
+  "aliasLabel": "Имя устройства",
+  "signInLogs": "Журнал входа",
+  "noLogs": "Попытки входа пока не записаны",
+  "clearLogs": "Очистить журнал",
+  "clearLogsConfirm": "Очистить журнал входа?",
+  "clearLogsDescription": "Все записанные попытки входа для этой установки будут удалены.",
+  "clear": "Очистить",
+  "cancel": "Отмена",
+  "showMore": "Показать ещё",
+  "success": "Успешно",
+  "rejected": "Отклонено",
+  "methodBasic": "Пароль",
+  "methodPair": "Сопряжение",
+  "viewLogs": "Просмотреть журнал",
+  "hideLogs": "Свернуть журнал",
+  "logRecording": "Записывать попытки входа",
+  "logRecordingHelp": "Сохранять успешные и отклонённые попытки входа в локальный файл.",
+  "logPath": "Файл журнала",
+  "fileSize": "Размер файла {{size}}",
+  "applyLogPath": "Сохранить путь к журналу",
+  "openLogFile": "Открыть файл журнала",
+  "error.aliasSaveFailed": "Не удалось сохранить имя устройства.",
+  "error.startFailed": "Не удалось запустить удалённый сервер.",
+  "error.browserFailed": "Не удалось открыть браузер.",
+  "error.logPath": "Укажите абсолютный путь к файлу.",
+  "error.logFile": "Выберите новый файл или существующий журнал удалённого доступа OpenCode.",
+  "error.logTooLarge": "Журнал больше 1 МиБ. Выберите другой файл.",
+  "error.logOpen": "Не удалось открыть файл журнала.",
+  "error.logSave": "Не удалось сохранить журнал.",
+  "dateLocale": "ru",
+  "error.invalidIp": "Укажите конкретный IPv4-адрес для прослушивания.",
+  "error.invalidPort": "Введите целое число от 1 до 65535.",
+  "error.invalidUsername": "Введите имя пользователя без двоеточий и управляющих символов.",
+  "error.invalidPassword": "Введите пароль без управляющих символов.",
+  "error.credentialsTooLong": "Имя пользователя может занимать до 256 байт, а пароль — до 1024 байт.",
+  "error.pluginClosing": "Плагин удалённого доступа завершает работу.",
+  "error.configRead": "Не удалось прочитать remote.json. Проверьте файл или снова сохраните настройки.",
+  "error.portConflict": "Порт {{port}} занят OpenCode Desktop. Выберите другой порт.",
+  "error.sidecarNotReady": "Локальная служба OpenCode ещё не готова.",
+  "error.ipNotAssigned": "Этот IP-адрес не назначен компьютеру. Проверьте подключение к сети или VPN.",
+  "error.portInUse": "Порт {{port}} уже используется. Выберите другой порт.",
+  "error.ipUnavailable": "Адрес прослушивания недоступен. Проверьте подключение к сети или VPN.",
+  "error.portPermission": "Нет разрешения на прослушивание порта {{port}}.",
+  "error.restoreFailed": "Не удалось восстановить предыдущий сервер. Проверьте адрес и порт, затем запустите сервер снова.",
+  "error.listenerStopped": "Сначала запустите удалённый сервер.",
+  "error.pairFailed": "Не удалось создать код сопряжения. Проверьте локальную службу OpenCode.",
+  "error.pairAddressMismatch": "Адрес ссылки для сопряжения не совпадает с адресом запущенного сервера.",
+  "error.invalidDeviceId": "Недопустимый идентификатор устройства.",
+  "error.invalidDeviceAlias": "Введите более короткое имя без управляющих символов.",
+  "error.aliasLimit": "Удалите одно из сохранённых имён, прежде чем добавить новое.",
+  "error.saveFailed": "Не удалось сохранить настройки удалённого доступа.",
+  "httpsListener": "HTTPS",
+  "httpsHelp": "Шифрование соединений браузеров и приложений с удалённым сервером.",
+  "httpsCertificateSettings": "Настройки сертификата",
+  "httpsCertificateHelp": "Оставьте оба пути пустыми, чтобы создать самоподписанный сертификат.",
+  "httpsHostname": "Имя хоста для доступа",
+  "httpsHostnamePlaceholder": "Пустое поле означает использование IP-адреса прослушивания",
+  "httpsCertificatePath": "Путь к сертификату PEM",
+  "httpsKeyPath": "Путь к закрытому ключу PEM",
+  "httpsChooseFile": "Выбрать файл",
+  "httpsAllFiles": "Все файлы",
+  "httpsSelfSigned": "Разрешите доверие этому самоподписанному сертификату на подключаемом устройстве",
+  "error.httpsSettings": "Недопустимые настройки HTTPS.",
+  "error.httpsHostname": "Укажите имя хоста без схемы, порта и пути.",
+  "error.httpsPathPair": "Укажите сертификат и закрытый ключ одновременно или оставьте оба поля пустыми.",
+  "error.httpsAbsolutePaths": "Используйте абсолютные пути к сертификату и закрытому ключу.",
+  "error.httpsRead": "Не удалось прочитать сертификат или закрытый ключ.",
+  "error.httpsInvalidPem": "Выберите действительный сертификат PEM и соответствующий незашифрованный закрытый ключ PEM.",
+  "error.httpsValidity": "Срок действия сертификата истёк или ещё не начался.",
+  "error.httpsCertificateHost": "Сертификат не подходит для {{host}}. Выберите подходящий сертификат или укажите имя хоста из сертификата.",
+  "error.httpsOpenSsl": "OpenSSL не найден. Установите его или выберите готовые сертификат и закрытый ключ.",
+  "error.httpsGenerate": "Не удалось создать самоподписанный сертификат.",
+  "error.httpsFilePicker": "Не удалось открыть окно выбора файла."
+};
+  };
   const cache = new Map();
 
   function load(id) {
@@ -3995,6 +4559,10 @@ exports.default = Plugin.define({
     const remote = ctx.main(Remote);
     const ui = ctx.ui;
     const t = (key, values) => ctx.t(key, values);
+    function notifyError(failure) {
+      const description = failure?.message || String(failure ?? "");
+      if (description) ctx.toast.show({ variant: "error", title: t("operationFailed"), description, duration: 7000 });
+    }
     ctx.add(SettingsPage, {
       id: "opencode-remote-access",
       get title() { return t("title"); },
@@ -4004,6 +4572,7 @@ exports.default = Plugin.define({
           { id: "listen-address", title: t("listenAddress") },
           { id: "login", title: t("credentials") },
           { id: "listener", title: t("listenerStatus") },
+          { id: "https", title: t("httpsListener") },
           { id: "allowed-sources", title: t("allowedSources") },
           { id: "login-log-file", title: t("signInLogs") },
         ];
@@ -4015,13 +4584,15 @@ exports.default = Plugin.define({
         const portConflict = () => localPort() > 0 && Number(port()) === localPort();
         const [username, setUsername] = createSignal("");
         const [allowedSources, setAllowedSources] = createSignal("");
+        const [https, setHttps] = createSignal({ enabled: false, hostname: "", certificatePath: "", keyPath: "" });
         const [password, setPassword] = createSignal("");
         const [visible, setVisible] = createSignal(false);
         const [ready, setReady] = createSignal(false);
         const [busy, setBusy] = createSignal(false);
-        const [error, setError] = createSignal("");
         const [pairing, setPairing] = createSignal();
-        const [listener, setListener] = createSignal({ url: "", peers: [], restarting: false, restartPending: false });
+        const [listener, setListener] = createSignal({
+          url: "", peers: [], restarting: false, restartPending: false, generatedCertificatePath: "",
+        });
         const [restartRequested, setRestartRequested] = createSignal(false);
         const [savedNotice, setSavedNotice] = createSignal("");
         const [logInfo, setLogInfo] = createSignal({ enabled: false, path: "", size: 0 });
@@ -4053,7 +4624,7 @@ exports.default = Plugin.define({
           void get().then((value) => {
             if (mounted && !updated) apply(value);
           }).catch((failure) => {
-            if (mounted) setError(failure.message);
+            if (mounted) notifyError(failure);
           });
         }
         onCleanup(remote.on("listenerChanged", (snapshot) => {
@@ -4065,7 +4636,7 @@ exports.default = Plugin.define({
         subscribe("deviceAliasesChanged", () => remote.deviceAliases(), setAliases);
         void remote.listener().then((snapshot) => {
           if (!subscribedUpdate) setListener(snapshot);
-        }).catch((failure) => setError(failure.message));
+        }).catch(notifyError);
 
         async function refresh() {
           const state = await remote.status();
@@ -4074,19 +4645,19 @@ exports.default = Plugin.define({
           setLocalPort(state.localPort);
           setUsername(state.config.username);
           setAllowedSources(state.config.allowedSources);
+          setHttps(state.config.https);
           setPassword(state.config.password);
-          setError(state.configError);
+          notifyError(state.configError);
         }
-        void refresh().catch((failure) => setError(failure.message)).finally(() => setReady(true));
+        void refresh().catch(notifyError).finally(() => setReady(true));
 
         async function act(operation) {
           if (busy()) return;
           setBusy(true);
-          setError("");
           try {
             await operation();
           } catch (failure) {
-            setError(failure.message || String(failure));
+            notifyError(failure);
           } finally {
             setBusy(false);
           }
@@ -4218,21 +4789,95 @@ exports.default = Plugin.define({
           button("openBrowser", () => remote.openBrowser(), () => !active() || restarting()),
           button("generateQr", async () => setPairing(await remote.pair()), () => !active() || restarting()),
         ]);
-        const errorMessage = element("p", "color:var(--v2-state-fg-error, #bc322a);white-space:pre-wrap", error);
-        errorMessage.setAttribute("role", "alert");
-
-        function closeDialogButton(key, onClick, variant = "neutral") {
+        function dialogButton(key, onClick, variant = "neutral", disabled = () => false) {
           return createComponent(ui.Button, {
             size: "small", variant,
             get children() { return t(key); },
+            get disabled() { return disabled(); },
             onClick,
           });
         }
 
+        async function applyHttps(settings) {
+          const restart = active() && (https().enabled || settings.enabled);
+          if (restart) setRestartRequested(true);
+          try {
+            setHttps(await remote.configureHttps(settings));
+            updateListener(await remote.listener());
+          } finally {
+            if (restart) setRestartRequested(false);
+          }
+        }
+
+        function editCertificate() {
+          ctx.dialogs.open((dialog) => {
+            const [settings, setSettings] = createSignal({ ...https() });
+            const [picking, setPicking] = createSignal(false);
+            const unavailable = () => busy() || picking();
+            const update = (key, value) => setSettings((current) => ({ ...current, [key]: value }));
+            async function pick(key, kind) {
+              if (unavailable()) return;
+              setPicking(true);
+              try {
+                const file = await remote.pickHttpsFile(kind);
+                if (file) update(key, file);
+              } catch (failure) {
+                notifyError(failure);
+              } finally {
+                setPicking(false);
+              }
+            }
+            async function saveCertificate() {
+              if (unavailable()) return;
+              setBusy(true);
+              try {
+                await applyHttps(settings());
+                dialog.close();
+              } catch (failure) {
+                notifyError(failure);
+              } finally {
+                setBusy(false);
+              }
+            }
+            const filePicker = (key, kind) => dialogButton(
+              "httpsChooseFile", () => void pick(key, kind), "neutral", unavailable,
+            );
+            return createComponent(ui.Dialog, {
+              get title() { return t("httpsCertificateSettings"); },
+              get description() { return t("httpsCertificateHelp"); },
+              children: element("div", "display:grid;gap:12px;padding-block:4px", [
+                field("httpsHostname", () => settings().hostname, (value) => update("hostname", value), {
+                  placeholder: "httpsHostnamePlaceholder",
+                }),
+                field("httpsCertificatePath", () => settings().certificatePath, (value) => update("certificatePath", value), {
+                  control: filePicker("certificatePath", "certificate"),
+                }),
+                field("httpsKeyPath", () => settings().keyPath, (value) => update("keyPath", value), {
+                  control: filePicker("keyPath", "key"),
+                }),
+              ]),
+              footer: element("div", "display:flex;justify-content:flex-end;gap:6px", [
+                dialogButton("cancel", dialog.close, "neutral", unavailable),
+                dialogButton("save", () => void saveCertificate(), "contrast", unavailable),
+              ]),
+            });
+          });
+        }
+
+        const httpsControls = element("div", "display:flex;align-items:center;flex-wrap:wrap;gap:8px", [
+          button("httpsCertificateSettings", editCertificate, restarting),
+          createComponent(ui.Switch, {
+            get label() { return t("httpsListener"); },
+            hideLabel: true,
+            get checked() { return https().enabled; },
+            get disabled() { return !ready() || busy() || restarting(); },
+            onChange: (enabled) => void act(() => applyHttps({ ...https(), enabled })),
+          }),
+        ]);
+
         function editAlias(item) {
           ctx.dialogs.open((dialog) => {
             const [alias, setAlias] = createSignal(item.alias ?? "");
-            const [dialogError, setDialogError] = createSignal("");
             const [saving, setSaving] = createSignal(false);
             async function apply(value) {
               if (saving()) return;
@@ -4241,7 +4886,7 @@ exports.default = Plugin.define({
                 await remote.setDeviceAlias({ deviceId: item.deviceId, alias: value });
                 dialog.close();
               } catch (failure) {
-                setDialogError(failure.message);
+                notifyError(failure);
               } finally {
                 setSaving(false);
               }
@@ -4254,12 +4899,11 @@ exports.default = Plugin.define({
                 onInput: setAlias,
                 onSubmit: () => void apply(alias()),
               }),
-              element("p", "color:var(--v2-state-fg-error)", dialogError),
             ]);
             const footer = element("div", "display:flex;justify-content:flex-end;gap:6px", [
-              ...(item.alias ? [closeDialogButton("removeAlias", () => void apply(""), "danger")] : []),
-              closeDialogButton("cancel", dialog.close),
-              closeDialogButton("save", () => void apply(alias()), "contrast"),
+              ...(item.alias ? [dialogButton("removeAlias", () => void apply(""), "danger")] : []),
+              dialogButton("cancel", dialog.close),
+              dialogButton("save", () => void apply(alias()), "contrast"),
             ]);
             return createComponent(ui.Dialog, {
               get title() { return t("deviceAliases"); },
@@ -4274,8 +4918,8 @@ exports.default = Plugin.define({
             get title() { return t("clearLogsConfirm"); },
             get description() { return t("clearLogsDescription"); },
             footer: element("div", "display:flex;justify-content:flex-end;gap:6px", [
-              closeDialogButton("cancel", dialog.close),
-              closeDialogButton("clear", () => {
+              dialogButton("cancel", dialog.close),
+              dialogButton("clear", () => {
                 dialog.close();
                 void act(async () => {
                   await remote.clearLoginLogs();
@@ -4329,6 +4973,15 @@ exports.default = Plugin.define({
               if (listener().restartPending) return [listener().url, t("pending")].filter(Boolean).join(" · ");
               return listener().url || (!restarting() ? t("listenerHelp") : "");
             }, actions),
+            row("https", () => t("httpsListener"), element("div", "display:grid;gap:4px;overflow-wrap:anywhere", [
+              () => t("httpsHelp"),
+              () => listener().generatedCertificatePath
+                ? element("div", "display:grid;gap:4px", [
+                  () => t("httpsSelfSigned"),
+                  element("span", "user-select:text", () => listener().generatedCertificatePath),
+                ])
+                : null,
+            ]), httpsControls),
             () => pairing() ? pairingPreview(pairing(), t, ui) : null,
           ],
         });
@@ -4378,18 +5031,19 @@ exports.default = Plugin.define({
               setLogPath(info.path);
               setLogInfo(info);
             }, () => !logPath() || logPath() === logInfo().path),
-            button("openLogFile", () => remote.openLoginLog(), () => !logInfo().path),
+            button("openLogFile", () => remote.openLoginLog(), () => !logs().length),
           ]),
         ]);
-        const logActions = element("div", "padding:12px 20px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+        const logActions = element("div", "padding:12px 20px;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px", [
+          element("span", "margin-inline-end:auto;color:var(--v2-text-text-muted)", () => !logs().length && !showLogs() ? t("noLogs") : ""),
           button(() => t(showLogs() ? "hideLogs" : "viewLogs"), async () => {
             if (!showLogs()) {
               setLogs(await remote.loginLogs());
               setVisibleLogs(25);
             }
             setShowLogs(!showLogs());
-          }),
-          button("clearLogs", confirmClear, () => !logInfo().size),
+          }, () => !showLogs() && !logs().length),
+          button("clearLogs", confirmClear, () => !logs().length),
         ]);
         const logSection = createComponent(ui.SettingsSection, {
           get title() { return t("signInLogs"); },
@@ -4426,7 +5080,7 @@ exports.default = Plugin.define({
         return createComponent(ui.SettingsLayout, {
           get title() { return t("title"); },
           get description() { return t("description"); },
-          children: [() => error() ? errorMessage : null, setupSection, listenerSection, connectionsSection, aliasesSection, logSection],
+          children: [setupSection, listenerSection, connectionsSection, aliasesSection, logSection],
         });
       },
     });

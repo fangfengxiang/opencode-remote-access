@@ -10,6 +10,7 @@ test("login log path, permissions, size, toggling and clear", async () => {
   const module = { exports: {} };
   const opened = [];
   let changes = 0;
+  let stored;
   try {
     const source = await fs.readFile(path.join(__dirname, "../src/login-log.cjs"), "utf8");
     vm.runInNewContext(source, {
@@ -23,15 +24,22 @@ test("login log path, permissions, size, toggling and clear", async () => {
     const ctx = {
       t: (key) => key,
       log: { write() {} },
-      storage: { store: (_key, { initial }) => ({
-        value: initial,
-        set(value) { this.value = value; },
-      }) },
+      storage: { store: (_key, { initial }) => {
+        stored ??= initial;
+        return {
+          get value() { return stored; },
+          set(value) { stored = value; },
+        };
+      } },
     };
     const log = module.exports.createLoginLog(ctx, { onChange: () => { changes++; } });
     const original = await log.info();
+    assert.equal(stored.path, "login.jsonl");
     assert.equal(original.path, path.join(home, ".opencode", "remote-access", "login.jsonl"));
     assert.equal(original.size, 0);
+    await log.open();
+    assert.deepEqual(opened, []);
+    await assert.rejects(fs.stat(original.path), { code: "ENOENT" });
     const event = {
       ip: "192.0.2.10", timestamp: Date.now(), deviceId: "test-device", deviceLabel: "Browser",
       method: "basic", success: true, isLocal: true, password: "never-write-this-fixture-password",
@@ -40,10 +48,11 @@ test("login log path, permissions, size, toggling and clear", async () => {
     await log.flush();
     assert.equal((await log.entries()).length, 1);
     assert.equal((await log.entries())[0].isLocal, true);
-    assert.equal((await fs.stat(original.path)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await fs.stat(original.path)).mode & 0o777, 0o600);
     assert.equal((await log.info()).size, (await fs.stat(original.path)).size);
     assert.ok(!(await fs.readFile(original.path, "utf8")).includes(event.password));
     await log.configure({ enabled: false, path: original.path });
+    assert.equal(stored.path, "login.jsonl");
     log.record(event);
     await log.flush();
     assert.equal((await log.entries()).length, 1);
@@ -60,6 +69,7 @@ test("login log path, permissions, size, toggling and clear", async () => {
     await assert.rejects(log.configure({ enabled: true, path: "relative.jsonl" }), /error.logPath/);
     const redirected = path.join(home, "configured", "sign-ins.jsonl");
     await log.configure({ enabled: true, path: redirected });
+    assert.equal(stored.path, redirected);
     log.record(event);
     await log.flush();
     assert.equal((await log.info()).path, redirected);
@@ -69,6 +79,10 @@ test("login log path, permissions, size, toggling and clear", async () => {
     assert.equal((await log.entries()).at(-1).method, "blocked");
     assert.equal((await fs.stat(original.path)).size, 0);
     assert.ok(changes >= 4);
+    stored = { enabled: false, path: original.path };
+    const migrated = module.exports.createLoginLog(ctx, { onChange() {} });
+    assert.equal(stored.path, "login.jsonl");
+    assert.equal((await migrated.info()).path, original.path);
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }

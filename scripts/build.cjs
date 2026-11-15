@@ -11,7 +11,8 @@ const root = join(__dirname, "..");
 const read = (name) => readFileSync(join(root, "src", name), "utf8").trimEnd();
 const moduleNames = [
   "gateway.cjs", "main.cjs", "control.cjs", "login-log.cjs",
-  "i18n.cjs", "pairing.cjs", "qrcode-generator.cjs", "source-filter.cjs",
+  "pairing.cjs", "qrcode-generator.cjs", "source-filter.cjs", "tls.cjs",
+  "i18n.cjs", "i18n/en.cjs", "i18n/zh.cjs", "i18n/zht.cjs", "i18n/ru.cjs",
 ];
 const modules = moduleNames.map((name) => {
   return `  factories[${JSON.stringify(`./${name}`)}] = function (require, module, exports) {\n${read(name)}\n  };`;

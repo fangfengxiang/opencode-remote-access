@@ -1,6 +1,6 @@
 # 功能说明
 
-**简体中文** · [English](features.en.md)
+**简体中文** · [English](en/features.md)
 
 | 功能 | 使用方式 |
 | --- | --- |
@@ -26,3 +26,7 @@
 - 自动生成 HTTPS 证书需要 PATH 中的 OpenSSL。自备 PEM 证书由 Node.js 加载。
 
 [OpenCode Desktop 官方安装包](https://opencode.ai/docs#desktop)
+
+## 运行边界
+
+配置文件中的密码以明文保存。HTTP 连接没有传输加密。连接数统计的是 TCP 连接，设备别名用于展示。登录日志是去重后的登录与拦截记录，同一来源的重复事件可能合并。

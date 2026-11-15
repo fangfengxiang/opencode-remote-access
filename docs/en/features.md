@@ -1,6 +1,6 @@
 # Features
 
-[简体中文](features.md) · **English**
+[简体中文](../features.md) · **English**
 
 | Feature | How to use it |
 | --- | --- |
@@ -26,3 +26,7 @@ Switching the listener disconnects its current remote connections. Previously pa
 - Certificate generation requires OpenSSL on PATH. Node.js loads user-supplied PEM files directly.
 
 [Official OpenCode Desktop downloads](https://opencode.ai/docs#desktop)
+
+## Operational limits
+
+The configuration file stores the password in plaintext. HTTP provides no transport encryption. Connection counts represent TCP connections, and aliases are display labels. The sign-in log deduplicates repeated authentication and blocked events.

@@ -1,6 +1,8 @@
-# Third-party component
+# 第三方组件
 
-The browser camera QR renderer uses [QR Code Generator for JavaScript](https://github.com/kazuhikoarase/qrcode-generator), version 2.0.4. The bundled source uses a CommonJS export.
+**简体中文** · [English](en/third-party.md)
+
+浏览器配对二维码使用 [QR Code Generator for JavaScript](https://github.com/kazuhikoarase/qrcode-generator) 2.0.4，打包源码使用 CommonJS 导出。以下保留原始许可证。
 
 Copyright (c) 2009 Kazuhiko Arase
 

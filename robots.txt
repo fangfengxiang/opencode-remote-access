@@ -1,0 +1,3 @@
+# Deploy at /robots.txt on the documentation origin. GitHub controls github.com crawling.
+User-agent: *
+Disallow:

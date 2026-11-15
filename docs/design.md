@@ -1,6 +1,6 @@
 # 设计文档
 
-**简体中文** · [English](design.en.md)
+**简体中文** · [English](en/design.md)
 
 ## 原生 GUI 与 IPC
 
@@ -33,3 +33,7 @@ OpenCode 本机服务产生一次性配对码，网关按当前监听登记。�
 桌面功能使用 OpenCode GUI、Electron 和 Node.js 跨平台接口。Unix 控制套接字仅用于 macOS 和 Linux 上的可选快捷命令。Windows 上使用桌面 IPC，跳过 Unix 套接字。
 
 `node scripts/build.cjs` 将 `src/` 内的 CommonJS 模块打包到 `gui-experimental.cjs`。GitHub 安装直接加载已提交的产物。`node scripts/build.cjs --check` 校验生成文件与源码一致。
+
+## 本地数据与会话
+
+设置页默认遮挡密码，配置文件仍保存原值。浏览器会话最长 30 天，设备标识 Cookie 最长 180 天。监听重建后，原配对会话失效。HTTPS 网关最低使用 TLS 1.2。

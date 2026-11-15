@@ -75,10 +75,11 @@ Add `~/.opencode/bin` to `PATH`. The shortcuts talk to the running Desktop app t
 
 ## Documentation and development
 
-- [Features](docs/features.en.md)
-- [Design](docs/design.en.md)
+- [Features](docs/en/features.md)
+- [Design](docs/en/design.md)
 - [MIT License](LICENSE)
-- [Third-party component](docs/third-party.md)
+- [Third-party component](docs/en/third-party.md)
+- [Community and related projects](docs/en/community.md)
 
 ```bash
 node scripts/build.cjs
@@ -87,3 +88,9 @@ npm test
 ```
 
 For local development, `./install.sh` registers the checkout. Ship both `src/` and the prebuilt `gui-experimental.cjs` in releases.
+
+## Authors
+
+[fangfengxiang](https://github.com/fangfengxiang) · Codex
+
+[AI documentation index](llms.txt)

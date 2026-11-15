@@ -1,6 +1,6 @@
 # Design
 
-[简体中文](design.md) · **English**
+[简体中文](../design.md) · **English**
 
 ## Native GUI and IPC
 
@@ -33,3 +33,7 @@ The default log path is stored as the relative filename `login.jsonl` and resolv
 Desktop functionality uses cross-platform OpenCode GUI, Electron, and Node.js APIs. The optional macOS and Linux shortcuts use a Unix socket. Windows uses Desktop IPC directly and skips the Unix socket server.
 
 `node scripts/build.cjs` bundles the CommonJS source from `src/` into `gui-experimental.cjs`. GitHub installs load the checked-in bundle. Run `node scripts/build.cjs --check` to verify it matches the source.
+
+## Local data and sessions
+
+The settings page masks the password by default, while the configuration file retains its original value. Browser sessions last up to 30 days and device identification cookies up to 180 days. Recreating the listener invalidates existing paired sessions. The HTTPS gateway uses TLS 1.2 or later.

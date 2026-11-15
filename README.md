@@ -79,6 +79,7 @@ cd opencode-remote-access
 - [设计文档](docs/design.md)
 - [MIT 许可证](LICENSE)
 - [第三方组件](docs/third-party.md)
+- [社区与相关项目](docs/community.md)
 
 ```bash
 node scripts/build.cjs
@@ -87,3 +88,9 @@ npm test
 ```
 
 本地开发时可用 `./install.sh` 注册源码目录。发布时提交 `src/` 和预构建的 `gui-experimental.cjs`。
+
+## 作者
+
+[fangfengxiang](https://github.com/fangfengxiang) · Codex
+
+[AI 文档索引](llms.txt)

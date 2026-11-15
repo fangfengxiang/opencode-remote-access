@@ -10,5 +10,9 @@
     "check:build": "node scripts/build.cjs --check",
     "test": "node scripts/build.cjs --check && node --test test/*.test.cjs && node test/main.cjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "author": "fangfengxiang",
+  "contributors": [
+    "Codex"
+  ]
 }
